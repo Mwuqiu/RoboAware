@@ -1,0 +1,6 @@
+{
+    "inference_type": "video2world",
+    "name": "gen_intent_chili",
+    "prompt_path": "pick_chili.txt",
+    "input_path": "Gen_Intent_0.mp4"
+}

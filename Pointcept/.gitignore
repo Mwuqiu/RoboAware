@@ -1,0 +1,13 @@
+# Training artifacts and experiment outputs
+/exp/
+/wandb/
+
+# Generated datasets/cache
+/pointflow/generated_pointclouds_dataset/
+/pointflow/cache/
+/libs/**/build/
+
+# Local runtime artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

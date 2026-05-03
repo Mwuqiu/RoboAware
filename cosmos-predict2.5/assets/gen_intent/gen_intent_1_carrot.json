@@ -1,0 +1,7 @@
+{
+    "inference_type": "video2world",
+    "name": "gen_intent_carrot",
+    "prompt_path": "pick_carrot.txt",
+    "input_path": "Gen_Intent_1.mp4",
+    "resolution": "480,832"
+}

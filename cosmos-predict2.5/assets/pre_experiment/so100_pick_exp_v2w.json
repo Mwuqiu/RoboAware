@@ -1,0 +1,6 @@
+{
+    "inference_type": "video2world",
+    "name": "so100_pick_exp",
+    "prompt_path": "so100_pick_exp1.txt",
+    "input_path": "so100_pick_exp1.mp4"
+}

@@ -1,0 +1,12 @@
+# Track only the two project folders in this monorepo.
+*
+!/.gitignore
+!/README.md
+!/cosmos-predict2.5/
+!/Pointcept/
+!/cosmos-predict2.5/**
+!/Pointcept/**
+
+# Common OS/editor noise
+**/.DS_Store
+**/.ipynb_checkpoints/
