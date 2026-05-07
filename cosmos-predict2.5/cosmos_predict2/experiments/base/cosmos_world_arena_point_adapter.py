@@ -30,14 +30,14 @@ _adapter_defaults = [
 ]
 
 _dataset_pc_encoder_config = dict(
-    DATASET="so100",
+    DATASET="robotwin",
     CONFIG="semseg-pt-v3m1-0-base",
     EXP_NAME="semseg-pt-v3m1-0-base-cosmos-pcenc",
     WEIGHT_NAME="model_last",
 )
 
 dataset_def = L(VideoDataset)(
-    dataset_dir="/root/autodl-tmp/cosmos_training_data_finial_dataset_based",
+    dataset_dir="/root/autodl-tmp/cosmos_training_data_world_arena",
     num_frames=93,
     video_size=(480, 832),
     pc_latent_source="online",
@@ -130,14 +130,14 @@ model_parallel_conf = dict(
     context_parallel_size=1,
 )
 
-EXPERIMENT_NAME = "predict2_point_adapter_training_2b_cosmos_so100_point"
+EXPERIMENT_NAME = "predict2_point_adapter_training_2b_cosmos_world_arena_point"
 
 experiment_config = dict(
     defaults=_adapter_defaults,
     job=dict(
         project="cosmos_predict_v2p5",
         group="point_adapter",
-        name="2b_cosmos_so100_point_adapter_vc",
+        name="2b_cosmos_world_arena_point_adapter",
     ),
     dataloader_train=dataloader_train,
     dataloader_val=dataloader_val,

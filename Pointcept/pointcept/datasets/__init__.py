@@ -25,3 +25,4 @@ from .dataloader import MultiDatasetDataloader
 
 # robot arm
 from .so100_arm import So100Dataset
+from .robotwin import RobotWinDataset

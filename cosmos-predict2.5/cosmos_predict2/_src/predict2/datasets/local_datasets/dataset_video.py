@@ -15,13 +15,12 @@
 
 """Generic video dataset loader for Cosmos Predict2."""
 
-import importlib.util
 import json
 import os
 import random
+import sys
 import threading
 import traceback
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -74,29 +73,22 @@ def _find_pointcept_root() -> Optional[Path]:
     return None
 
 
-@lru_cache(maxsize=1)
-def _load_pointcept_encoder_module():
-    pointcept_root = _find_pointcept_root()
-    if pointcept_root is None:
-        raise PointcloudEncodingConfigurationError(
-            "Could not locate the Pointcept repository. Set POINTCEPT_ROOT to your Pointcept checkout."
-        )
-
-    pf_encoder_path = pointcept_root / "pointflow" / "pf_encoder.py"
-    spec = importlib.util.spec_from_file_location("cosmos_predict2_pointcept_pf_encoder", pf_encoder_path)
-    if spec is None or spec.loader is None:
-        raise PointcloudEncodingConfigurationError(f"Failed to import Pointcept encoder module from {pf_encoder_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    module.CONFIG_FILE = _make_absolute_pointcept_path(pointcept_root, module.CONFIG_FILE)
-    module.EXP_DIR = _make_absolute_pointcept_path(pointcept_root, module.EXP_DIR)
-    module.WEIGHT_PATH = _make_absolute_pointcept_path(pointcept_root, module.WEIGHT_PATH)
-    return module
+# ── Pointcept pf_encoder import ──────────────────────────────────────────────
+# pf_encoder.py internally does sys.path.insert(0, ...) to add the Pointcept
+# root, so the only thing cosmos needs is to make the pointflow directory
+# importable.
+_pointcept_root = _find_pointcept_root()
+if _pointcept_root is None:
+    raise PointcloudEncodingConfigurationError(
+        "Could not locate the Pointcept repository. Set POINTCEPT_ROOT to your Pointcept checkout."
+    )
+_pointflow_dir = str(_pointcept_root / "pointflow")
+if _pointflow_dir not in sys.path:
+    sys.path.insert(0, _pointflow_dir)
+import pf_encoder  # noqa: E402
 
 
-def _get_online_pointcloud_encoder() -> torch.nn.Module:
+def _get_online_pointcloud_encoder(pc_encoder_config: Optional[dict] = None) -> torch.nn.Module:
     if not torch.cuda.is_available():
         raise PointcloudEncodingConfigurationError(
             "Online pointcloud encoding requires CUDA because Pointcept loads its checkpoint onto GPU."
@@ -108,8 +100,11 @@ def _get_online_pointcloud_encoder() -> torch.nn.Module:
     with _POINTCEPT_ENCODER_LOCK:
         encoder = _POINTCEPT_ENCODERS.get(device_key)
         if encoder is None:
-            module = _load_pointcept_encoder_module()
-            encoder = module.PTV3Encoder(module.load_ptv3_model()).to(device)
+            pf_encoder.apply_encoder_config(pc_encoder_config or {})
+            pf_encoder.CONFIG_FILE = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.CONFIG_FILE)
+            pf_encoder.EXP_DIR = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.EXP_DIR)
+            pf_encoder.WEIGHT_PATH = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.WEIGHT_PATH)
+            encoder = pf_encoder.PTV3Encoder(pf_encoder.load_ptv3_model()).to(device)
             encoder.eval()
             for parameter in encoder.parameters():
                 parameter.requires_grad_(False)
@@ -133,6 +128,7 @@ class VideoDataset(Dataset):
         pc_latent_pad_value: float = 0.0,
         pc_latent_amp: bool = False,
         pc_latent_grid_size: float = 0.005,
+        pc_encoder_config: Optional[dict] = None,
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -161,6 +157,7 @@ class VideoDataset(Dataset):
         self.pc_latent_pad_value = float(pc_latent_pad_value)
         self.pc_latent_amp = bool(pc_latent_amp)
         self.pc_latent_grid_size = float(pc_latent_grid_size)
+        self.pc_encoder_config = pc_encoder_config
 
         if self.pc_latent_source not in {"precomputed", "online", "auto"}:
             raise ValueError(
@@ -257,7 +254,7 @@ class VideoDataset(Dataset):
             "grid_size": float(episode.get("grid_size") or self.pc_latent_grid_size),
         }
 
-        encoder = _get_online_pointcloud_encoder()
+        encoder = _get_online_pointcloud_encoder(self.pc_encoder_config)
         feats, mask = encoder.encode_batch(
             [encoder_input],
             k=self.pc_latent_k,

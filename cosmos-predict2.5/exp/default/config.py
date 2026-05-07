@@ -2,10 +2,10 @@ weight = None
 resume = False
 evaluate = True
 test_only = False
-seed = 39437764
+seed = 25594642
 save_path = 'exp/default'
 num_worker = 16
-batch_size = 48
+batch_size = 24
 gradient_accumulation_steps = 1
 batch_size_val = None
 batch_size_test = None
@@ -36,7 +36,7 @@ train = dict(type='DefaultTrainer')
 test = dict(type='SemSegTester', verbose=True)
 model = dict(
     type='DefaultSegmentorV2',
-    num_classes=7,
+    num_classes=16,
     backbone_out_channels=64,
     backbone=dict(
         type='PT-v3m1',
@@ -86,24 +86,26 @@ scheduler = dict(
     anneal_strategy='cos',
     div_factor=10.0,
     final_div_factor=100.0)
-dataset_type = 'So100Dataset'
-data_root = '/home/wuqiu/segment_training_dataset_final'
+dataset_type = 'RobotWinDataset'
+data_root = '/home/wuqiu/segment_training_dataset_robotwin'
 ignore_index = -1
 names = [
-    'Base', 'Rotation_Pitch', 'Upper_Arm', 'Lower_Arm', 'Wrist_Pitch_Roll',
-    'Fixed_Jaw', 'Moving_Jaw'
+    'fl_link1', 'fl_link2', 'fl_link3', 'fl_link4', 'fl_link5', 'fl_link6',
+    'fl_link7', 'fl_link8', 'fr_link1', 'fr_link2', 'fr_link3', 'fr_link4',
+    'fr_link5', 'fr_link6', 'fr_link7', 'fr_link8'
 ]
 data = dict(
-    num_classes=7,
+    num_classes=16,
     ignore_index=-1,
     names=[
-        'Base', 'Rotation_Pitch', 'Upper_Arm', 'Lower_Arm', 'Wrist_Pitch_Roll',
-        'Fixed_Jaw', 'Moving_Jaw'
+        'fl_link1', 'fl_link2', 'fl_link3', 'fl_link4', 'fl_link5', 'fl_link6',
+        'fl_link7', 'fl_link8', 'fr_link1', 'fr_link2', 'fr_link3', 'fr_link4',
+        'fr_link5', 'fr_link6', 'fr_link7', 'fr_link8'
     ],
     train=dict(
-        type='So100Dataset',
+        type='RobotWinDataset',
         split='training',
-        data_root='/home/wuqiu/segment_training_dataset_final',
+        data_root='/home/wuqiu/segment_training_dataset_robotwin',
         transform=[
             dict(
                 type='GridSample',
@@ -121,9 +123,9 @@ data = dict(
         ignore_index=-1,
         loop=2),
     val=dict(
-        type='So100Dataset',
+        type='RobotWinDataset',
         split='validation',
-        data_root='/home/wuqiu/segment_training_dataset_final',
+        data_root='/home/wuqiu/segment_training_dataset_robotwin',
         transform=[
             dict(type='Copy', keys_dict=dict(segment='origin_segment')),
             dict(
@@ -143,9 +145,9 @@ data = dict(
         test_mode=False,
         ignore_index=-1),
     test=dict(
-        type='So100Dataset',
+        type='RobotWinDataset',
         split='validation',
-        data_root='/home/wuqiu/segment_training_dataset_final',
+        data_root='/home/wuqiu/segment_training_dataset_robotwin',
         transform=[
             dict(type='Copy', keys_dict=dict(segment='origin_segment')),
             dict(

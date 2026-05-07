@@ -26,13 +26,49 @@ from timm.models.vision_transformer import Mlp, Attention
 
 DATASET = "so100"
 CONFIG = "semseg-pt-v3m1-0-base"
-# EXP_NAME = "semseg-pt-v3m1-0-base-only-grid"
 EXP_NAME = "semseg-pt-v3m1-0-base-cosmos-pcenc"
 WEIGHT_NAME = "model_last"
 
 CONFIG_FILE = os.path.join("configs", DATASET, f"{CONFIG}.py")
 EXP_DIR = os.path.join("exp", DATASET, EXP_NAME)
 WEIGHT_PATH = os.path.join(EXP_DIR, "model", f"{WEIGHT_NAME}.pth")
+
+
+def apply_encoder_config(config: dict):
+    """Apply caller-supplied overrides to module-level encoder configuration.
+
+    Accepted keys: DATASET, CONFIG, EXP_NAME, WEIGHT_NAME,
+                    CONFIG_FILE, EXP_DIR, WEIGHT_PATH.
+
+    If CONFIG_FILE / EXP_DIR / WEIGHT_PATH are given directly they take
+    precedence.  Otherwise the toolkit-level keys DATASET / CONFIG /
+    EXP_NAME / WEIGHT_NAME are combined (with os.path.join) to form the
+    full paths.
+    """
+    global DATASET, CONFIG, EXP_NAME, WEIGHT_NAME
+    global CONFIG_FILE, EXP_DIR, WEIGHT_PATH
+
+    # Direct path overrides (highest priority)
+    if "CONFIG_FILE" in config:
+        CONFIG_FILE = config["CONFIG_FILE"]
+    if "EXP_DIR" in config:
+        EXP_DIR = config["EXP_DIR"]
+    if "WEIGHT_PATH" in config:
+        WEIGHT_PATH = config["WEIGHT_PATH"]
+
+    # Toolkit-level keys (used when direct paths not provided)
+    for key in ("DATASET", "CONFIG", "EXP_NAME", "WEIGHT_NAME"):
+        if key in config:
+            globals()[key] = config[key]
+
+    # Recompute paths from toolkit-level keys if direct paths were not
+    # explicitly overridden
+    if "CONFIG_FILE" not in config:
+        CONFIG_FILE = os.path.join("configs", DATASET, f"{CONFIG}.py")
+    if "EXP_DIR" not in config:
+        EXP_DIR = os.path.join("exp", DATASET, EXP_NAME)
+    if "WEIGHT_PATH" not in config:
+        WEIGHT_PATH = os.path.join(EXP_DIR, "model", f"{WEIGHT_NAME}.pth")
 
 
 def _force_spconv_native_algo(module: torch.nn.Module) -> int:
