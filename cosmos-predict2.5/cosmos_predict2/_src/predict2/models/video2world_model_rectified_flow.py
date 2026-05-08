@@ -54,6 +54,7 @@ class Video2WorldModelRectifiedFlowConfig(Text2WorldModelRectifiedFlowConfig):
     conditional_frames_probs: Optional[Dict[int, float]] = None  # Probability distribution for conditional frames
     point_diffusion_loss_weight: float = 1.0
     point_condition_frames: int = 2
+    point_latent_scale: float = 1.0
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -81,6 +82,9 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         kwargs = condition.to_dict(skip_underscore=False)
         kwargs.update({key: value for key, value in updates.items() if key in kwargs})
         return type(condition)(**kwargs)
+
+    def _point_latent_scale(self) -> float:
+        return max(float(getattr(self.config, "point_latent_scale", 1.0)), 1.0e-6)
 
     def _align_point_temporal(self, point: torch.Tensor, target_t: int) -> torch.Tensor:
         if point is None or point.shape[1] == target_t:
@@ -115,7 +119,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         if pc_x0 is None:
             return condition, None
 
-        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype)
+        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype) / self._point_latent_scale()
         pc_noise = torch.randn_like(pc_x0)
         pc_sigmas_B_1 = sigmas_B_1.to(device=pc_x0.device, dtype=pc_x0.dtype)
         pc_xt, pc_vt = self.rectified_flow.get_interpolation(pc_noise, pc_x0, pc_sigmas_B_1)
@@ -229,7 +233,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             )
             return condition, None
 
-        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype)
+        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype) / self._point_latent_scale()
         B, T_pc, K, _ = pc_x0.shape
         n_cond = min(max(int(self.config.point_condition_frames), 0), T_pc)
 

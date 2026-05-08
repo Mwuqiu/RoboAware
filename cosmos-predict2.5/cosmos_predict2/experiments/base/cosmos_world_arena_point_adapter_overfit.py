@@ -127,6 +127,7 @@ model_conf = dict(
         denoise_replace_gt_frames=True,
         point_diffusion_loss_weight=0.05,
         point_condition_frames=2,
+        point_latent_scale=40.0,
         net=dict(
             point_adapter_d_a=None,
             point_adapter_num_adapter_blocks=4,
