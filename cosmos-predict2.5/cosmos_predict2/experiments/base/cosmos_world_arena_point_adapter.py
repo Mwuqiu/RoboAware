@@ -84,8 +84,8 @@ trainer_conf = dict(
         heart_beat=dict(save_s3=False),
         iter_speed=dict(hit_thres=200, save_s3=False),
         device_monitor=dict(save_s3=False),
-        every_n_sample_reg=dict(every_n=500, save_s3=False),
-        every_n_sample_ema=dict(every_n=500, save_s3=False),
+        every_n_sample_reg=dict(every_n=500, save_s3=False, guidance=[3.0], do_x0_prediction=False),
+        every_n_sample_ema=dict(every_n=1000000000, save_s3=False, guidance=[3.0], do_x0_prediction=False),
         wandb=dict(save_s3=False),
         wandb_10x=dict(save_s3=False),
         dataloader_speed=dict(save_s3=False),
@@ -96,7 +96,7 @@ trainer_conf = dict(
             do_x0_prediction=True,
         ),
         validation_draw_sample_ema=L(ValidationDrawSample)(
-            n_samples=2,
+            n_samples=0,
             is_ema=True,
             save_s3=False,
             do_x0_prediction=True,
@@ -113,6 +113,8 @@ model_conf = dict(
         conditional_frame_timestep=-1.0,
         conditioning_strategy="frame_replace",
         denoise_replace_gt_frames=True,
+        point_diffusion_loss_weight=0.015,
+        point_condition_frames=2,
         net=dict(
             point_adapter_d_a=None,
             point_adapter_num_adapter_blocks=4,
@@ -137,7 +139,7 @@ experiment_config = dict(
     job=dict(
         project="cosmos_predict_v2p5",
         group="point_adapter",
-        name="2b_cosmos_world_arena_point_adapter",
+        name="2b_cosmos_world_arena_point_adapter_with_pc_diffusion",
     ),
     dataloader_train=dataloader_train,
     dataloader_val=dataloader_val,

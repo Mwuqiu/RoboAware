@@ -282,7 +282,11 @@ class ValidationDrawSample(Callback):
 
                 assert x0_save_dir is not None
                 for fp in os.listdir(x0_save_dir):
-                    imgs.append(wandb.Image(os.path.join(x0_save_dir, fp), caption=f"{sample_counter}"))
+                    full_fp = os.path.join(x0_save_dir, fp)
+                    imgs.append(
+                        wandb.Video(full_fp, caption=f"{sample_counter}", fps=self.fps, format="mp4")
+                        if fp.endswith(".mp4") else wandb.Image(full_fp, caption=f"{sample_counter}")
+                    )
                 info[f"{self.name}/{tag}_x0"] = imgs
                 # convert mse_loss to a dict
                 mse_loss = mse_loss.tolist()
@@ -291,7 +295,11 @@ class ValidationDrawSample(Callback):
             assert sample_save_dir is not None
             imgs = []
             for idx, fp in enumerate(os.listdir(sample_save_dir)):
-                imgs.append(wandb.Image(os.path.join(sample_save_dir, fp), caption=f"{sample_counter}"))
+                full_fp = os.path.join(sample_save_dir, fp)
+                imgs.append(
+                    wandb.Video(full_fp, caption=f"{sample_counter}", fps=self.fps, format="mp4")
+                    if fp.endswith(".mp4") else wandb.Image(full_fp, caption=f"{sample_counter}")
+                )
 
             info[f"{self.name}/{tag}_sample"] = imgs
             wandb.log(
@@ -374,34 +382,8 @@ class ValidationDrawSample(Callback):
 
         local_save_dir = os.path.join(self.local_dir, save_path)
         os.makedirs(local_save_dir, exist_ok=True)
-        local_path = os.path.join(local_save_dir, f"{self.rank}.jpg")
-
-        if self.wandb_online:
-            if is_single_frame:  # image case
-                to_show = rearrange(
-                    to_show[:, :n_viz_sample],
-                    "n b c t h w -> t c (n h) (b w)",
-                )
-                image_grid = torchvision.utils.make_grid(to_show, nrow=1, padding=0, normalize=False)
-                # resize so that wandb can handle it
-                torchvision.utils.save_image(resize_image(image_grid, 1024), local_path, nrow=1, scale_each=True)
-            else:
-                to_show = to_show[:, :n_viz_sample]  # [n, b, c, 3, h, w]
-
-                # resize 3 frames frames so that we can display them on wandb
-                _T = to_show.shape[3]
-                three_frames_list = [0, _T // 2, _T - 1]
-                to_show = to_show[:, :, :, three_frames_list]
-                log_image_size = 1024
-                to_show = rearrange(
-                    to_show,
-                    "n b c t h w -> 1 c (n h) (b t w)",
-                )
-
-                # resize so that wandb can handle it
-                image_grid = torchvision.utils.make_grid(to_show, nrow=1, padding=0, normalize=False)
-                torchvision.utils.save_image(
-                    resize_image(image_grid, log_image_size), local_path, nrow=1, scale_each=True
-                )
+        local_base_path = os.path.join(local_save_dir, f"{self.rank}")
+        to_save = rearrange(to_show[:, :n_viz_sample], "n b c t h w -> c t (n h) (b w)")
+        save_img_or_video(to_save, local_base_path, fps=self.fps)
 
         return local_save_dir

@@ -207,7 +207,10 @@ class PCVideo2WorldCondition(Text2WorldCondition):
     condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None
 
     pc_latent_x0: Optional[torch.Tensor] = None
+    pc_latent_xt: Optional[torch.Tensor] = None
     pc_latent_mask: Optional[torch.Tensor] = None
+    pc_condition_mask: Optional[torch.Tensor] = None
+    num_conditional_frames_B: Optional[torch.Tensor] = None
 
     def set_video_condition(
         self,
@@ -292,6 +295,7 @@ class PCVideo2WorldCondition(Text2WorldCondition):
             condition_video_input_mask_B_C_T_H_W[idx, :, : num_conditional_frames_B[idx], :, :] += 1
 
         kwargs["condition_video_input_mask_B_C_T_H_W"] = condition_video_input_mask_B_C_T_H_W
+        kwargs["num_conditional_frames_B"] = num_conditional_frames_B.to(device=gt_frames.device)
         return type(self)(**kwargs)
 
     def edit_for_inference(
@@ -477,7 +481,8 @@ _Point_CONFIG = dict(
     ),
     pc_condition=L(PcLatentRemapDrop)(
         input_key=["pc_latent_x0", "pc_latent_mask"],
-        dropout_rate=0.2,
+        # Point diffusion uses pc_latent_x0 as the denoising target; do not drop the target or valid mask.
+        dropout_rate=0.0,
     ),
 )
 

@@ -119,6 +119,8 @@ class PointAdapter(nn.Module):
 
         self.before_proj = nn.Linear(d_a, d_a, bias=True)
         self.after_projs = nn.ModuleList([nn.Linear(d_a, d_main, bias=True) for _ in range(self.num_adapter_blocks)])
+        self.pc_out_norm = nn.LayerNorm(d_a)
+        self.pc_out_head = nn.Linear(d_a, d_pc, bias=True)
 
         block_factory_kwargs = block_factory_kwargs or {}
         self.adapter_blocks = nn.ModuleList([
@@ -152,9 +154,15 @@ class PointAdapter(nn.Module):
                 if hasattr(block, "init_weights"):
                     block.init_weights()
 
-        # GeoAdapter 风格 zero-init：before_proj + after_proj 全零
-        nn.init.zeros_(self.before_proj.weight)
+        # before_proj modulates the point stream with video context; keep point information alive at init.
+        nn.init.xavier_uniform_(self.before_proj.weight)
         nn.init.zeros_(self.before_proj.bias)
+        nn.init.ones_(self.pc_out_norm.weight)
+        nn.init.zeros_(self.pc_out_norm.bias)
+        nn.init.xavier_uniform_(self.pc_out_head.weight)
+        nn.init.zeros_(self.pc_out_head.bias)
+
+        # GeoAdapter-style zero-init only for point-to-video residuals.
         for after_proj in self.after_projs:
             nn.init.zeros_(after_proj.weight)
             nn.init.zeros_(after_proj.bias)
@@ -271,6 +279,11 @@ class PointAdapter(nn.Module):
             residuals.append(residual)
         return residuals
 
+    def predict_pc(self, pc_feat_BT_K_da: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        """Project the final point stream back to the original point latent dimension."""
+        pc_feat_B_T_K_da = rearrange(pc_feat_BT_K_da, "(b t) k d -> b t k d", b=B, t=T)
+        return self.pc_out_head(self.pc_out_norm(pc_feat_B_T_K_da))
+
     def apply_stage(
         self,
         adapter_idx: int,
@@ -292,7 +305,7 @@ class PointAdapter(nn.Module):
         if adapter_idx == 0:
             x_global_B_T_da = self.x_proj(x_main).mean(dim=(2, 3))
             x_global_B_T_1_1_da = rearrange(x_global_B_T_da, "b t d -> b t 1 1 d")
-            c_B_T_1_K_da = self.before_proj(c_B_T_1_K_da) + x_global_B_T_1_1_da
+            c_B_T_1_K_da = c_B_T_1_K_da + self.before_proj(x_global_B_T_1_1_da)
 
         emb_B_T_da = self.t_proj(t_embedding_B_T_D)
 

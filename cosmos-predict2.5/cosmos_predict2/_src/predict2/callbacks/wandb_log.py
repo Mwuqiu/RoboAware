@@ -71,6 +71,8 @@ class WandbCallback(Callback):
         self.train_image_log = _LossRecord()
         self.train_video_log = _LossRecord()
         self.final_loss_log = _LossRecord()
+        self.extra_loss_sums: dict[str, torch.Tensor] = {}
+        self.extra_loss_count = 0
 
         self.img_unstable_count = torch.zeros(1, device="cuda")
         self.video_unstable_count = torch.zeros(1, device="cuda")
@@ -146,6 +148,11 @@ class WandbCallback(Callback):
             self.final_loss_log.loss += loss.detach().float()
             self.final_loss_log.iter_count += 1
             self.final_loss_log.edm_loss += output_batch["edm_loss"].detach().float()
+            self.extra_loss_count += 1
+            for key in ["video_loss_scaled", "pc_diffusion_loss", "pc_loss_weighted", "pc_to_video_loss_ratio"]:
+                value = output_batch.get(key)
+                if value is not None:
+                    self.extra_loss_sums[key] = self.extra_loss_sums.get(key, torch.zeros((), device="cuda")) + value.detach().float()
         else:
             if model.is_image_batch(data_batch):
                 self.img_unstable_count += 1
@@ -160,6 +167,13 @@ class WandbCallback(Callback):
             avg_image_loss, avg_image_edm_loss = self.train_image_log.get_stat()
             avg_video_loss, avg_video_edm_loss = self.train_video_log.get_stat()
             avg_final_loss, avg_final_edm_loss = self.final_loss_log.get_stat()
+            extra_loss_info = {}
+            for key, value in self.extra_loss_sums.items():
+                avg_value = value / max(self.extra_loss_count, 1)
+                dist.all_reduce(avg_value, op=dist.ReduceOp.AVG)
+                extra_loss_info[f"train{self.wandb_extra_tag}/{key}"] = avg_value.item()
+            self.extra_loss_sums = {}
+            self.extra_loss_count = 0
 
             dist.all_reduce(self.img_unstable_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(self.video_unstable_count, op=dist.ReduceOp.SUM)
@@ -180,6 +194,13 @@ class WandbCallback(Callback):
                         "sample_counter": getattr(self.trainer, "sample_counter", iteration),
                     }
                 )
+                info.update(extra_loss_info)
+                if timer_results:
+                    timer_msg = ", ".join(f"{key}={value:.2f}s" for key, value in sorted(timer_results.items()))
+                    log.info(f"Timer average over last {self.config.trainer.logging_iter} iters: {timer_msg}")
+                if extra_loss_info:
+                    loss_msg = ", ".join(f"{key.split('/')[-1]}={value:.4g}" for key, value in sorted(extra_loss_info.items()))
+                    log.info(f"Loss breakdown over last {self.config.trainer.logging_iter} iters: {loss_msg}")
                 if self.save_s3:
                     if (
                         iteration

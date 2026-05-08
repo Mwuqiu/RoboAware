@@ -256,12 +256,18 @@ class EveryNDrawSample(EveryN):
                 "sample_counter": sample_counter,
             }
             if self.do_x0_prediction:
-                info[f"{self.name}/{tag}_x0"] = wandb.Image(x0_img_fp, caption=f"{sample_counter}")
+                info[f"{self.name}/{tag}_x0"] = (
+                    wandb.Video(x0_img_fp, caption=f"{sample_counter}", fps=self.fps, format="mp4")
+                    if x0_img_fp and x0_img_fp.endswith(".mp4") else wandb.Image(x0_img_fp, caption=f"{sample_counter}")
+                )
                 # convert mse_loss to a dict
                 mse_loss = mse_loss.tolist()
                 info.update({f"x0_pred_mse_{tag}/Sigma{sigmas[i]:0.5f}": mse_loss[i] for i in range(len(mse_loss))})
 
-            info[f"{self.name}/{tag}_sample"] = wandb.Image(sample_img_fp, caption=f"{sample_counter}")
+            info[f"{self.name}/{tag}_sample"] = (
+                wandb.Video(sample_img_fp, caption=f"{sample_counter}", fps=self.fps, format="mp4")
+                if sample_img_fp and sample_img_fp.endswith(".mp4") else wandb.Image(sample_img_fp, caption=f"{sample_counter}")
+            )
             wandb.log(
                 info,
                 step=iteration,
@@ -340,36 +346,9 @@ class EveryNDrawSample(EveryN):
                 fps=self.fps,
             )
 
-        file_base_fp = f"{base_fp_wo_ext}_resize.jpg"
-        local_path = f"{self.local_dir}/{file_base_fp}"
-
-        if self.rank == 0 and wandb.run:
-            if is_single_frame:  # image case
-                to_show = rearrange(
-                    to_show[:, :n_viz_sample],
-                    "n b c t h w -> t c (n h) (b w)",
-                )
-                image_grid = torchvision.utils.make_grid(to_show, nrow=1, padding=0, normalize=False)
-                # resize so that wandb can handle it
-                torchvision.utils.save_image(resize_image(image_grid, 1024), local_path, nrow=1, scale_each=True)
-            else:
-                to_show = to_show[:, :n_viz_sample]  # [n, b, c, 3, h, w]
-
-                # resize 3 frames frames so that we can display them on wandb
-                _T = to_show.shape[3]
-                three_frames_list = [0, _T // 2, _T - 1]
-                to_show = to_show[:, :, :, three_frames_list]
-                log_image_size = 1024
-                to_show = rearrange(
-                    to_show,
-                    "n b c t h w -> 1 c (n h) (b t w)",
-                )
-
-                # resize so that wandb can handle it
-                image_grid = torchvision.utils.make_grid(to_show, nrow=1, padding=0, normalize=False)
-                torchvision.utils.save_image(
-                    resize_image(image_grid, log_image_size), local_path, nrow=1, scale_each=True
-                )
-
-            return local_path
+        if self.rank == 0:
+            to_save = rearrange(to_show[:, :n_viz_sample], "n b c t h w -> c t (n h) (b w)")
+            local_base_path = f"{self.local_dir}/{base_fp_wo_ext}"
+            save_img_or_video(to_save, local_base_path, fps=self.fps)
+            return f"{local_base_path}.jpg" if is_single_frame else f"{local_base_path}.mp4"
         return None

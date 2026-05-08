@@ -2117,7 +2117,9 @@ class MiniTrainDIT(WeightTrainingStat):
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
         pc_latent_x0: Optional[torch.Tensor] = None,
+        pc_latent_xt: Optional[torch.Tensor] = None,
         pc_latent_mask: Optional[torch.Tensor] = None,
+        pc_condition_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
 
         assert isinstance(data_type, DataType)
@@ -2159,24 +2161,23 @@ class MiniTrainDIT(WeightTrainingStat):
         # 由于 PointAdapter 需要「当前 block 输出」才能计算残差，
         # 我们采用「在线注入」策略：每到注入点，立即调用对应的 adapter_block。
 
-        use_pc = pc_latent_x0 is not None
+        pc_input = pc_latent_xt if pc_latent_xt is not None else pc_latent_x0
+        use_pc = pc_input is not None
         if use_pc:
-            # PC Encoder + 时间对齐（统一在 PointAdapter.forward 内完成）
-            # 这里只做断言检查
-            assert pc_latent_x0.ndim == 4, f"expected pc_latent_x0 shape [B, T_pc, K, D], got {tuple(pc_latent_x0.shape)}"
-            assert pc_latent_x0.shape[0] == B, \
-                f"batch size mismatch: x={B}, pc={pc_latent_x0.shape[0]}"
+            assert pc_input.ndim == 4, f"expected point latent shape [B, T_pc, K, D], got {tuple(pc_input.shape)}"
+            assert pc_input.shape[0] == B, \
+                f"batch size mismatch: x={B}, pc={pc_input.shape[0]}"
 
-            # 提前做 PC Encoder + 时间对齐，得到 pc_feat [B, T, K, d_a]
-            # 以及对齐后的 mask，供后续在线注入使用
+            # Keep the full point timeline for the point diffusion head; align only a copy for video injection.
             main_dtype = x_B_T_H_W_D.dtype
 
-            pc_feat_encoded = self.point_adapter.pc_encoder(pc_latent_x0.to(main_dtype))  # [B, T_pc, K, d_a]
-            pc_feat_encoded = self.point_adapter._align_temporal(pc_feat_encoded, T)  # [B, T, K, d_a]
+            pc_feat_full = self.point_adapter.pc_encoder(pc_input.to(main_dtype))  # [B, T_pc, K, d_a]
+            T_pc = pc_feat_full.shape[1]
+            pc_feat_video = self.point_adapter._align_temporal(pc_feat_full, T)  # [B, T, K, d_a]
+            pc_feat_video_base = pc_feat_video
 
             if pc_latent_mask is not None:
-                T_pc = pc_latent_x0.shape[1]
-                K = pc_latent_x0.shape[2]
+                K = pc_input.shape[2]
                 pc_mask_float = pc_latent_mask.float()                      # [B, T_pc, K]
                 pc_mask_BK_T = rearrange(pc_mask_float, "b t k -> (b k) 1 t")
                 if T_pc != T:
@@ -2188,7 +2189,7 @@ class MiniTrainDIT(WeightTrainingStat):
                 pc_mask_aligned = None
 
             # 转为 [B*T, K, d_a] 供在线注入使用
-            pc_feat_BT = rearrange(pc_feat_encoded, "b t k d -> (b t) k d")
+            pc_feat_BT = rearrange(pc_feat_video, "b t k d -> (b t) k d")
             pc_mask_BT = (
                 rearrange(pc_mask_aligned, "b t k -> (b t) k")
                 if pc_mask_aligned is not None else None
@@ -2242,6 +2243,15 @@ class MiniTrainDIT(WeightTrainingStat):
         # ── Final Layer ──────────────────────────────────────────────────────────
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+        if use_pc:
+            pc_feat_video_out = rearrange(pc_feat_BT, "(b t) k d -> b t k d", b=B, t=T)
+            pc_feat_video_delta = pc_feat_video_out - pc_feat_video_base
+            pc_feat_head = pc_feat_full + self.point_adapter._align_temporal(pc_feat_video_delta, T_pc)
+            pc_pred = self.point_adapter.predict_pc(
+                rearrange(pc_feat_head, "b t k d -> (b t) k d"), B=B, T=T_pc
+            )
+        else:
+            pc_pred = None
 
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
@@ -2251,6 +2261,9 @@ class MiniTrainDIT(WeightTrainingStat):
                     f"Requested IDs: {intermediate_feature_ids}"
                 )
             return x_B_C_Tt_Hp_Wp, intermediate_features_outputs
+
+        if pc_pred is not None:
+            return x_B_C_Tt_Hp_Wp, pc_pred
 
         return x_B_C_Tt_Hp_Wp
 

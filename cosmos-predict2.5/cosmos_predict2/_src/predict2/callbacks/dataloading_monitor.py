@@ -20,7 +20,7 @@ import torch
 import wandb
 
 from cosmos_predict2._src.imaginaire.model import ImaginaireModel
-from cosmos_predict2._src.imaginaire.utils import distributed
+from cosmos_predict2._src.imaginaire.utils import distributed, log
 from cosmos_predict2._src.imaginaire.utils.callback import Callback
 from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
 
@@ -84,6 +84,13 @@ class DetailedDataLoadingSpeedMonitor(Callback):
                     "slowest_rank/slowest_dataloading_time": max_dataloading.item(),
                 }
             )
+
+            if distributed.is_rank0():
+                log.info(
+                    f"Dataloader timing over last {self.every_n} iters: "
+                    f"slowest_rank={slowest_dataloading_rank_id.item()}, "
+                    f"slowest_mean={max_dataloading.item():.2f}s"
+                )
 
             if wandb.run:
                 wandb.log(wandb_info, step=iteration)
