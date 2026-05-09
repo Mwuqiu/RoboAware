@@ -51,7 +51,7 @@ dataset_def = L(VideoDataset)(
     video_paths=OVERFIT_VIDEO_PATHS,
     num_frames=93,
     video_size=(480, 832),
-    pc_latent_source="online",
+    pc_latent_source="precomputed",
     pc_latent_amp=True,
     pc_encoder_config=pc_encoder_config,
 )
@@ -61,8 +61,10 @@ dataloader_train = L(get_generic_dataloader)(
     sampler=L(get_sampler)(dataset=dataset_def),
     batch_size=1,
     drop_last=True,
-    num_workers=0,
+    num_workers=4,
     pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
 )
 
 dataloader_val = L(get_generic_dataloader)(
@@ -70,8 +72,10 @@ dataloader_val = L(get_generic_dataloader)(
     sampler=L(get_sampler)(dataset=dataset_def),
     batch_size=1,
     drop_last=True,
-    num_workers=0,
+    num_workers=4,
     pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
 )
 
 optimizer_conf = dict(

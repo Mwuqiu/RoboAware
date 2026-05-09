@@ -10,7 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from pf_encoder import load_ptv3_model, PTV3Encoder
+import pf_encoder
+from pf_encoder import PTV3Encoder
 
 
 class CosmosPointcloudEpisodeDataset(Dataset):
@@ -36,6 +37,46 @@ class CosmosPointcloudEpisodeDataset(Dataset):
             raise KeyError(f"Missing 'coord' in {path}")
         d["__path__"] = path
         return d
+
+
+
+POINTCEPT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _pointcept_abs(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(POINTCEPT_ROOT, path))
+
+
+def configure_point_encoder(args) -> dict:
+    encoder_config = {
+        "DATASET": args.encoder_dataset,
+        "CONFIG": args.encoder_config,
+        "EXP_NAME": args.encoder_exp_name,
+        "WEIGHT_NAME": args.encoder_weight_name,
+    }
+    if args.config_file:
+        encoder_config["CONFIG_FILE"] = args.config_file
+    if args.exp_dir:
+        encoder_config["EXP_DIR"] = args.exp_dir
+    if args.weight_path:
+        encoder_config["WEIGHT_PATH"] = args.weight_path
+
+    pf_encoder.apply_encoder_config(encoder_config)
+    pf_encoder.CONFIG_FILE = _pointcept_abs(pf_encoder.CONFIG_FILE)
+    pf_encoder.EXP_DIR = _pointcept_abs(pf_encoder.EXP_DIR)
+    pf_encoder.WEIGHT_PATH = _pointcept_abs(pf_encoder.WEIGHT_PATH)
+
+    return {
+        "CONFIG_FILE": pf_encoder.CONFIG_FILE,
+        "EXP_DIR": pf_encoder.EXP_DIR,
+        "WEIGHT_PATH": pf_encoder.WEIGHT_PATH,
+        "DATASET": pf_encoder.DATASET,
+        "CONFIG": pf_encoder.CONFIG,
+        "EXP_NAME": pf_encoder.EXP_NAME,
+        "WEIGHT_NAME": pf_encoder.WEIGHT_NAME,
+    }
 
 
 def collate_as_list(batch: List[Dict[str, Any]]):
@@ -156,6 +197,15 @@ def preencode_one_dataset(
             "k": int(k),
             "sample": str(sample),
             "pad_value": float(pad_value),
+            "encoder": {
+                "DATASET": pf_encoder.DATASET,
+                "CONFIG": pf_encoder.CONFIG,
+                "EXP_NAME": pf_encoder.EXP_NAME,
+                "WEIGHT_NAME": pf_encoder.WEIGHT_NAME,
+                "CONFIG_FILE": pf_encoder.CONFIG_FILE,
+                "EXP_DIR": pf_encoder.EXP_DIR,
+                "WEIGHT_PATH": pf_encoder.WEIGHT_PATH,
+            },
         }
         torch.save(payload, out_path)
         written += 1
@@ -181,6 +231,13 @@ def main():
     ap.add_argument("--max_datasets", type=int, default=None)
     ap.add_argument("--max_episodes", type=int, default=None)
     ap.add_argument("--grid_size", type=float, required=True)
+    ap.add_argument("--encoder_dataset", default="robotwin")
+    ap.add_argument("--encoder_config", default="semseg-pt-v3m1-0-base")
+    ap.add_argument("--encoder_exp_name", default="semseg-pt-v3m1-0-base-cosmos-pcenc")
+    ap.add_argument("--encoder_weight_name", default="model_last")
+    ap.add_argument("--config_file", default=None, help="Optional direct Pointcept config path")
+    ap.add_argument("--exp_dir", default=None, help="Optional direct Pointcept experiment directory")
+    ap.add_argument("--weight_path", default=None, help="Optional direct Pointcept checkpoint path")
     ap.add_argument(
         "--num_shards",
         type=int,
@@ -220,7 +277,12 @@ def main():
         f"(local_rank={args.local_rank})"
     )
 
-    encoder = PTV3Encoder(load_ptv3_model()).to(device)
+    encoder_config = configure_point_encoder(args)
+    print("Point encoder config:")
+    for key, value in encoder_config.items():
+        print(f"  {key}: {value}")
+
+    encoder = pf_encoder.PTV3Encoder(pf_encoder.load_ptv3_model()).to(device)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
