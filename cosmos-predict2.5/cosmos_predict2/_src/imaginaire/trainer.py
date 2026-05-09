@@ -300,7 +300,8 @@ class ImaginaireTrainer:
                     # Do the following when an actual optimizer (update) step has been made.
                     iteration += 1
                     # Save checkpoint.
-                    if iteration % self.config.checkpoint.save_iter == 0:
+                    save_iter = int(self.config.checkpoint.save_iter)
+                    if save_iter > 0 and iteration % save_iter == 0:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
                     # Validation.
@@ -316,7 +317,8 @@ class ImaginaireTrainer:
                 if _end_training:
                     break
         log.success("Done with training.")
-        if iteration % self.config.checkpoint.save_iter != 0:
+        save_iter = int(self.config.checkpoint.save_iter)
+        if save_iter > 0 and iteration % save_iter != 0:
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()
