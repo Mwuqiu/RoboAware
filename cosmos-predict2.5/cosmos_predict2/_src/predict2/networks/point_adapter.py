@@ -147,13 +147,29 @@ class PointAdapter(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # PCEncoder 已经在自己 __init__ 里 init.
-        # 每个 adapter Block 用 Cosmos Block 自带的 init_weights (含 adaLN-zero).
-        # adaLN-zero 让训练初期 Block(x) ≈ x, delta ≈ 0, 不破坏 backbone;
-        # 同时 PC → adapter 通路梯度全程通畅, 不再有 zero-init 死锁.
+        # PCEncoder: re-init explicitly here (xavier_uniform_). We don't rely on
+        # PCEncoder's own __init__-time init, because cosmos instantiates the
+        # whole model on `device='meta'` first and only later does
+        #   net.to_empty(device=...); net.init_weights()
+        # to materialize and re-init. So *this* method is the canonical entry
+        # point for adapter init and must reset every trainable parameter.
+        for m in self.pc_encoder.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Each adapter Block uses the backbone Cosmos Block's own init_weights
+        # (includes adaLN-zero for the modulation last layer, trunc_normal for
+        # q/k/v in self/cross attention).
         for block in self.adapter_blocks:
             if hasattr(block, "init_weights"):
                 block.init_weights()
+
+    def init_weights(self) -> None:
+        """Public init hook called by MinimalV4DiT.init_weights() after the
+        framework's meta -> cpu / meta -> cuda materialization. See `_init_weights`."""
+        self._init_weights()
 
     # ───────────────────────── 时间维度对齐 ────────────────────────────────
     @staticmethod

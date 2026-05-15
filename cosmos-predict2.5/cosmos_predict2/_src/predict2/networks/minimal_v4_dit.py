@@ -1,3 +1,4 @@
+ 
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -1881,6 +1882,15 @@ class MiniTrainDIT(WeightTrainingStat):
         if self.extra_image_context_dim is not None:
             self.img_context_proj[0].reset_parameters()
 
+        # PointAdapter init must be re-run here. Cosmos materializes the model
+        # from `device='meta'` and then calls this method to populate all
+        # tensors; if we don't include the adapter subtree it stays at the
+        # all-zero state left by `to_empty()`, which silently kills training.
+        # (Guarded because init_weights() is also called during __init__ before
+        # self.point_adapter is constructed.)
+        if hasattr(self, "point_adapter"):
+            self.point_adapter.init_weights()
+
     def build_patch_embed(self):
         (
             concat_padding_mask,
@@ -2403,3 +2413,4 @@ def replace_selfattn_op_with_sparse_attn_op(
             block.self_attn.register_module("attn_op", sparse_attn_op)
 
     return model
+
