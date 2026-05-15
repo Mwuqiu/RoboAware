@@ -197,6 +197,19 @@ class CheckpointFileHf(_CheckpointHf):
     @override
     def _download(self) -> str:
         """Download checkpoint and return the local path."""
+        # Cache-first: if the file already exists in the standard HF cache layout,
+        # return it directly. Avoids requiring `uvx` (which is not installed in
+        # every environment) and avoids re-downloading on offline machines.
+        hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+        org_repo = self.repository.replace("/", "--")
+        cached = os.path.join(
+            hf_home, "hub", f"models--{org_repo}",
+            "snapshots", self.revision, self.filename,
+        )
+        if os.path.isfile(cached):
+            log.info(f"[hf cache hit] {self.repository}@{self.revision[:8]} :: {self.filename} -> {cached}")
+            return cached
+
         cmd_args = [
             self.repository,
             "--repo-type",
@@ -229,6 +242,18 @@ class CheckpointDirHf(_CheckpointHf):
     @override
     def _download(self) -> str:
         """Download checkpoint and return the local path."""
+        # Cache-first: standard HF cache layout is hub/models--<org>--<repo>/snapshots/<rev>/[<subdir>].
+        # If that directory exists locally, return it directly; avoids the uvx dependency.
+        hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+        org_repo = self.repository.replace("/", "--")
+        snap_root = os.path.join(
+            hf_home, "hub", f"models--{org_repo}", "snapshots", self.revision,
+        )
+        cached = os.path.join(snap_root, self.subdirectory) if self.subdirectory else snap_root
+        if os.path.isdir(cached):
+            log.info(f"[hf cache hit] {self.repository}@{self.revision[:8]} :: dir {self.subdirectory or '(root)'} -> {cached}")
+            return cached
+
         include = list(self.include) or ["*"]
         exclude = list(self.exclude)
         if self.subdirectory:
@@ -409,3 +434,4 @@ def download_checkpoint(checkpoint_uri: str, *, check_exists: bool = True) -> st
 
 get_checkpoint_path = download_checkpoint
 """DEPRECATED: Use 'download_checkpoint' instead."""
+

@@ -129,6 +129,8 @@ class VideoDataset(Dataset):
         pc_latent_amp: bool = False,
         pc_latent_grid_size: float = 0.005,
         pc_encoder_config: Optional[dict] = None,
+        pc_conditioning_mode_probs: Optional[dict[str, float]] = None,
+        pc_conditioning_prefix_frames: int | list[int] | tuple[int, ...] = 2,
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -158,6 +160,10 @@ class VideoDataset(Dataset):
         self.pc_latent_amp = bool(pc_latent_amp)
         self.pc_latent_grid_size = float(pc_latent_grid_size)
         self.pc_encoder_config = pc_encoder_config
+        self.pc_conditioning_mode_probs = self._normalize_pc_conditioning_mode_probs(pc_conditioning_mode_probs)
+        self.pc_conditioning_prefix_frames = self._normalize_pc_conditioning_prefix_frames(
+            pc_conditioning_prefix_frames
+        )
 
         if self.pc_latent_source not in {"precomputed", "online", "auto"}:
             raise ValueError(
@@ -201,6 +207,79 @@ class VideoDataset(Dataset):
             log.info(
                 "VideoDataset will compute pc_latent online from pointclouds; DataLoader workers should stay at 0."
             )
+
+    @staticmethod
+    def _normalize_pc_conditioning_mode_probs(
+        mode_probs: Optional[dict[str, float]],
+    ) -> dict[str, float]:
+        if mode_probs is None:
+            mode_probs = {"full": 1.0}
+
+        valid_modes = {"full", "prefix", "none"}
+        unknown_modes = set(mode_probs) - valid_modes
+        if unknown_modes:
+            raise ValueError(
+                f"Unknown pc_conditioning_mode_probs keys: {sorted(unknown_modes)}. "
+                f"Valid keys are {sorted(valid_modes)}"
+            )
+
+        normalized = {mode: max(float(mode_probs.get(mode, 0.0)), 0.0) for mode in valid_modes}
+        total = sum(normalized.values())
+        if total <= 0.0:
+            raise ValueError("pc_conditioning_mode_probs must contain at least one positive probability")
+        return {mode: prob / total for mode, prob in normalized.items()}
+
+    @staticmethod
+    def _normalize_pc_conditioning_prefix_frames(
+        prefix_frames: int | list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if isinstance(prefix_frames, int):
+            values = (prefix_frames,)
+        elif isinstance(prefix_frames, (list, tuple)) or (
+            hasattr(prefix_frames, "__iter__") and not isinstance(prefix_frames, (str, bytes))
+        ):
+            values = tuple(int(value) for value in prefix_frames)
+        else:
+            raise TypeError(
+                "pc_conditioning_prefix_frames must be an int or an iterable of ints, "
+                f"got {type(prefix_frames)!r}"
+            )
+
+        if not values or any(value <= 0 for value in values):
+            raise ValueError(
+                f"pc_conditioning_prefix_frames must contain positive integers, got {values}"
+            )
+        return values
+
+    def _sample_pc_conditioning_mode(self) -> str:
+        sample = random.random()
+        cumulative = 0.0
+        for mode in ("full", "prefix", "none"):
+            cumulative += self.pc_conditioning_mode_probs[mode]
+            if sample <= cumulative:
+                return mode
+        return "none"
+
+    def _apply_pc_conditioning_policy(
+        self, pc_x0: torch.Tensor, pc_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mode = self._sample_pc_conditioning_mode()
+        if mode == "full":
+            return pc_x0, pc_mask.bool()
+
+        pc_x0 = pc_x0.clone()
+        pc_mask = pc_mask.clone().bool()
+        if mode == "none":
+            pc_mask.zero_()
+        elif mode == "prefix":
+            keep_frames = min(random.choice(self.pc_conditioning_prefix_frames), pc_mask.shape[0])
+            if keep_frames < pc_mask.shape[0]:
+                pc_mask[keep_frames:] = False
+        else:
+            raise ValueError(f"Unsupported pc conditioning mode: {mode}")
+
+        pc_x0 = pc_x0.masked_fill(~pc_mask[..., None], 0)
+        return pc_x0, pc_mask
 
     def _check_all_precomputed_pc_latents_available(self) -> bool:
         if not os.path.isdir(self.pc_latent_dir):
@@ -402,7 +481,7 @@ class VideoDataset(Dataset):
 
             pc_latent = self._load_pc_latent_window(video_basename, start_frame)
             if pc_latent is not None:
-                pc_x0, pc_mask = pc_latent
+                pc_x0, pc_mask = self._apply_pc_conditioning_policy(*pc_latent)
                 data["pc_latent_x0"] = pc_x0
                 data["pc_latent_mask"] = pc_mask
 

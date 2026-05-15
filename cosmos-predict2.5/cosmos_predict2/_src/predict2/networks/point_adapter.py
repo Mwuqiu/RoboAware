@@ -1,3 +1,38 @@
+"""PointAdapter A.v3
+
+设计要点（与原版的差异）
+────────────────────────
+1. PC 通过 Cosmos Block 的 cross-attn (K/V) 注入主干, 不再 mean-pool + spatial broadcast.
+   每个 video patch (h, w) 在 K=30 个 PC token 中自己挑 attention 权重.
+2. Adapter Block 与 backbone Cosmos Block 同构 (同一个 block_factory). x_dim=d_main,
+   context_dim=d_main (PC 已投到 d_main); init/adaLN-zero 复用 backbone 已验证的 scheme.
+3. Block 在 (B*T) 维度上 per-frame 工作: 输入 [B*T, 1, H, W, D], cross-attn K/V
+   是该 latent t 的 PC token [B*T, K, D]. 满足"PC 与 video 逐帧对齐, 不跨时间 attend".
+4. 不再使用 d_a 中间瓶颈 / x_proj / t_proj / before_proj / after_projs.
+   唯一的 zero-init 由 Block 自带的 adaLN-zero 提供, 不会堵 PC → adapter 的梯度通路.
+5. Frame-level mask: prefix mode 后段 / none mode 等 PC 不可见的 frame, 输出强制为 0,
+   完全交给 backbone 通过 temporal layers 自己 propagate.
+
+外部契约
+────────
+PointAdapter 暴露给 backbone (minimal_v4_dit.py) 的接口完全保持不变:
+  - .pc_encoder(pc_latent)            backbone 在 forward 入口直接 call
+  - ._align_temporal(pc_feat, T)      backbone 在 forward 入口直接 call
+  - .inject_block_ids                 list[int]
+  - .apply_stage(adapter_idx=, pc_feat_BT_K_da=, pc_mask_BT_K=,
+                 x_main=, t_embedding_B_T_D=, crossattn_emb=)
+                                       返回 (pc_feat_next, residual);
+                                       residual shape == x_main.shape, 直接 add.
+所以 minimal_v4_dit.py 不需要任何改动.
+
+注意
+────
+- d_a 必须等于 d_main. exp 配置里 point_adapter_d_a=None (= d_main) 已经满足.
+- adapter_block_depth 必须为 1.
+- 旧 checkpoint 的 PointAdapter 子模块 shape 与新版完全不同, 不能 resume,
+  需要从 backbone+text 已有的 base checkpoint 起重新训.
+"""
+
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -5,7 +40,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+
 class PCEncoder(nn.Module):
+    """把 Pointcept 输出的 PC latent 投到主干维度.
+
+    backbone 在 forward 入口直接 call self.pc_encoder(pc_latent_x0).
+    输入 [B, T_pc, K, D_pc], 输出 [B, T_pc, K, d_a] (d_a == d_main).
+    """
 
     def __init__(self, d_pc: int, d_a: int):
         super().__init__()
@@ -14,48 +55,21 @@ class PCEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(d_a, d_a, bias=True),
         )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, pc: torch.Tensor) -> torch.Tensor:
         return self.mlp(pc)
 
 
 class PointAdapter(nn.Module):
-    """
-    PointAdapter：将点云信息以 zero-init 残差方式注入 Cosmos 主干。
-    内部仅使用与主干同构的 Cosmos Block，不再包含轻量自定义 Block 分支。
-
-    架构：
-        PC latent [B, T_pc, K, D_pc]
-              │
-        [PCEncoder]  →  [B, T, K, d_a]          (时间维度对齐到主干 T)
-              │
-        ┌─────────────────────────────────┐
-        │  Cosmos Block Stage 0           │  ←  接收主干 block_{inj[0]-1} 的输出投影
-        └──────────────┬──────────────────┘
-                   │ after_proj(d_a → D_main), zero-init
-                       ▼
-          主干 Block 3 output  +=  residual_0
-                       │
-        ┌──────────────▼──────────────────┐
-        │  Cosmos Block Stage 1           │  ←  接收主干 block_{inj[1]-1} 的输出投影
-        └──────────────┬──────────────────┘
-                   │ after_proj
-                       ▼
-          主干 Block 7 output  +=  residual_1
-                       │
-                   ... (共 N 个注入点) ...
-
-    参数：
-        d_pc        (int):  点云 latent 原始维度（= crossattn_emb_channels）
-        d_main      (int):  Cosmos 主干维度（= model_channels = 8192）
-        d_a         (int):  Adapter 内部维度，默认 512
-        num_adapter_blocks (int): 注入点数量，默认 7
-        adapter_block_depth (int): 每个注入点内部串联的 Cosmos Block 数量，默认 1
-        inject_every_k (int): 每隔 k 个主干 block 注入一次，默认 4
-        num_main_blocks (int): 主干总 block 数，默认 28
-        block_factory: Cosmos Block 构造器（必填）
-        block_factory_kwargs: 传给 block_factory 的参数
-    """
+    """A.v3: 同构 Cosmos Block + cross-attn (video Q ↔ PC K/V) 注入."""
 
     def __init__(
         self,
@@ -74,22 +88,28 @@ class PointAdapter(nn.Module):
         block_factory_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        del num_heads, mlp_ratio, dropout
-        self.d_a = d_a
-        self.d_main = d_main
-        self.num_adapter_blocks = int(num_adapter_blocks)
-        self.adapter_block_depth = int(adapter_block_depth)
-        if block_factory is None:
-            raise ValueError("PointAdapter now requires block_factory (Cosmos Block) and no longer supports legacy blocks")
+        del num_heads, mlp_ratio, dropout  # 通过 block_factory_kwargs 传给 Cosmos Block
 
-        if self.adapter_block_depth < 1:
+        if block_factory is None:
+            raise ValueError("PointAdapter requires block_factory (Cosmos Block)")
+        if d_a != d_main:
             raise ValueError(
-                f"adapter_block_depth must be >= 1, got {self.adapter_block_depth}"
+                f"A.v3 要求 d_a == d_main (取消 d_a 中间瓶颈). "
+                f"got d_a={d_a}, d_main={d_main}. 在 experiment 里把 point_adapter_d_a=None 即可."
+            )
+        if int(adapter_block_depth) != 1:
+            raise ValueError(
+                f"A.v3 不支持 adapter_block_depth>1 (每个 inject 点单 Block). "
+                f"got {adapter_block_depth}"
             )
 
-        # ── 注入点计算 ──────────────────────────────────────────────────────
+        self.d_a = d_a
+        self.d_main = d_main
+        self.adapter_block_depth = 1
+
+        # ── 注入点解析 (与原版一致) ─────────────────────────────────────────
         if inject_block_ids is not None:
-            normalized_ids = sorted(set(int(i) for i in inject_block_ids))
+            normalized_ids = sorted({int(i) for i in inject_block_ids})
             if not normalized_ids:
                 raise ValueError("inject_block_ids is empty")
             if normalized_ids[0] < 0 or normalized_ids[-1] >= num_main_blocks:
@@ -99,8 +119,7 @@ class PointAdapter(nn.Module):
             self.inject_block_ids = normalized_ids
             self.num_adapter_blocks = len(self.inject_block_ids)
         else:
-            # 注入点为每组最后一个 block 的 idx（0-indexed）
-            # k=4: [3, 7, 11, 15, 19, 23, 27]
+            self.num_adapter_blocks = int(num_adapter_blocks)
             self.inject_block_ids = [
                 inject_every_k * (i + 1) - 1
                 for i in range(self.num_adapter_blocks)
@@ -109,156 +128,152 @@ class PointAdapter(nn.Module):
             if len(self.inject_block_ids) != self.num_adapter_blocks:
                 raise ValueError(
                     f"注入点数量 {len(self.inject_block_ids)} 与 num_adapter_blocks "
-                    f"{self.num_adapter_blocks} 不匹配，请检查 inject_every_k / num_main_blocks 设置。"
+                    f"{self.num_adapter_blocks} 不匹配, 请检查 inject_every_k / num_main_blocks."
                 )
 
-        # ── 子模块 ──────────────────────────────────────────────────────────
+        # ── PCEncoder: D_pc → d_main, xavier init ──────────────────────────
         self.pc_encoder = PCEncoder(d_pc=d_pc, d_a=d_a)
-        self.x_proj = nn.Linear(d_main, d_a, bias=False) if d_main != d_a else nn.Identity()
-        self.t_proj = nn.Linear(d_main, d_a, bias=False) if d_main != d_a else nn.Identity()
 
-        self.before_proj = nn.Linear(d_a, d_a, bias=True)
-        self.after_projs = nn.ModuleList([nn.Linear(d_a, d_main, bias=True) for _ in range(self.num_adapter_blocks)])
+        # ── Adapter Blocks: 每个 inject 点一个 Cosmos Block, 与 backbone 同构 ──
+        # 关键: x_dim=d_main (输入 video tokens), context_dim=d_main (PC 已投到 d_main).
+        block_factory_kwargs = dict(block_factory_kwargs or {})
+        block_factory_kwargs["context_dim"] = d_main
+        block_factory_kwargs["image_context_dim"] = None  # 不用 I2V cross-attn
 
-        block_factory_kwargs = block_factory_kwargs or {}
-        self.adapter_blocks = nn.ModuleList([
-            nn.ModuleList(
-                [block_factory(x_dim=d_a, **block_factory_kwargs) for _ in range(self.adapter_block_depth)]
-            )
-            for _ in range(self.num_adapter_blocks)
-        ])
+        self.adapter_blocks = nn.ModuleList(
+            [block_factory(x_dim=d_main, **block_factory_kwargs) for _ in range(self.num_adapter_blocks)]
+        )
+
         self._init_weights()
 
-    # ── 初始化 ────────────────────────────────────────────────────────────────
+    def _init_weights(self) -> None:
+        # PCEncoder 已经在自己 __init__ 里 init.
+        # 每个 adapter Block 用 Cosmos Block 自带的 init_weights (含 adaLN-zero).
+        # adaLN-zero 让训练初期 Block(x) ≈ x, delta ≈ 0, 不破坏 backbone;
+        # 同时 PC → adapter 通路梯度全程通畅, 不再有 zero-init 死锁.
+        for block in self.adapter_blocks:
+            if hasattr(block, "init_weights"):
+                block.init_weights()
 
-    def _init_weights(self):
-        # PC Encoder：标准初始化
-        for m in self.pc_encoder.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # x_proj：标准初始化
-        if isinstance(self.x_proj, nn.Linear):
-            nn.init.xavier_uniform_(self.x_proj.weight)
-
-        if isinstance(self.t_proj, nn.Linear):
-            nn.init.xavier_uniform_(self.t_proj.weight)
-
-        # Adapter stage 内部：复用 Cosmos Block 初始化。
-        for stage in self.adapter_blocks:
-            for block in stage:
-                if hasattr(block, "init_weights"):
-                    block.init_weights()
-
-        # GeoAdapter 风格 zero-init：before_proj + after_proj 全零
-        nn.init.zeros_(self.before_proj.weight)
-        nn.init.zeros_(self.before_proj.bias)
-        for after_proj in self.after_projs:
-            nn.init.zeros_(after_proj.weight)
-            nn.init.zeros_(after_proj.bias)
-
-    # ── 时间维度对齐 ──────────────────────────────────────────────────────────
-
+    # ───────────────────────── 时间维度对齐 ────────────────────────────────
     @staticmethod
-    def _align_temporal(
-        pc: torch.Tensor,       # [B, T_pc, K, d_a]
-        T_target: int,
-    ) -> torch.Tensor:
-        """
-        将点云时间维度 T_pc 对齐到主干时间维度 T_target。
-        使用自适应平均池化（沿时间轴），支持 T_pc != T_target 的任意情况。
+    def _align_temporal(pc: torch.Tensor, T_target: int) -> torch.Tensor:
+        """[B, T_pc, K, d] → [B, T, K, d].
 
-        策略：
-          - T_pc == T_target：直接返回
-          - T_pc >  T_target：沿 T 做 adaptive_avg_pool1d 下采样
-          - T_pc <  T_target：线性插值上采样
+        backbone 在 forward 入口直接 call (minimal_v4_dit.py:2176), 接口必须保留.
+        当前用 adaptive_avg_pool, 简单稳定; 已知缺点是会抹平相邻帧的运动差异.
+        若以后要换 learnable 1D conv, 改这里即可, 不影响 backbone.
         """
-        B, T_pc, K, d_a = pc.shape
+        B, T_pc, K, d = pc.shape
         if T_pc == T_target:
             return pc
-
-        # reshape 为 [B*K, d_a, T_pc]，沿时间做 1D 池化/插值
-        pc_BK_da_T = rearrange(pc, "b t k d -> (b k) d t")
-
+        pc_BK_d_T = rearrange(pc, "b t k d -> (b k) d t")
         if T_pc > T_target:
-            # 下采样：adaptive average pooling
-            pc_BK_da_T = F.adaptive_avg_pool1d(pc_BK_da_T, T_target)
+            pc_BK_d_T = F.adaptive_avg_pool1d(pc_BK_d_T, T_target)
         else:
-            # 上采样：线性插值
-            pc_BK_da_T = F.interpolate(
-                pc_BK_da_T, size=T_target, mode="linear", align_corners=False
+            pc_BK_d_T = F.interpolate(
+                pc_BK_d_T, size=T_target, mode="linear", align_corners=False
             )
+        return rearrange(pc_BK_d_T, "(b k) d t -> b t k d", b=B, k=K)
 
-        pc_aligned = rearrange(pc_BK_da_T, "(b k) d t -> b t k d", b=B, k=K)
-        return pc_aligned
+    # ───────────────────────── 单 stage 注入 ───────────────────────────────
+    def apply_stage(
+        self,
+        adapter_idx: int,
+        pc_feat_BT_K_da: torch.Tensor,         # [B*T, K, d_main], 来自 PCEncoder + _align_temporal
+        pc_mask_BT_K: Optional[torch.Tensor],  # [B*T, K] bool, True=有效
+        x_main: torch.Tensor,                  # [B, T, H, W, d_main], backbone block 输出
+        t_embedding_B_T_D: Optional[torch.Tensor] = None,
+        crossattn_emb: Optional[torch.Tensor] = None,  # 传 backbone 的 text emb, 本设计不用
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A.v3 注入: video tokens 作为 query, PC tokens 作为 cross-attn K/V.
 
-    # ── forward ───────────────────────────────────────────────────────────────
+        Returns:
+            pc_feat_next: [B*T, K, d_main]  (本版本不更新 PC, passthrough; 保留接口)
+            residual:     [B, T, H, W, d_main]  直接 add 到 backbone block output
+        """
+        del crossattn_emb  # adapter 不用 text; PC 自带空间结构
 
+        if t_embedding_B_T_D is None:
+            raise ValueError("Cosmos Block adapter requires t_embedding_B_T_D")
+
+        B, T, H, W, D = x_main.shape
+
+        # ── reshape video 到 per-frame batch ──
+        # Block 看到的 input shape 是 (B*T, 1, H, W, D), 内部 self-attn over (1*H*W) per frame
+        x_BT_1_H_W_D = rearrange(x_main, "b t h w d -> (b t) 1 h w d")
+        # t_embedding 形状通常是 (B, 1, D) — 整段 video 共用一个 diffusion timestep emb,
+        # 在 backbone 内部依靠 broadcast 作用到所有 latent frame.
+        # 我们把 video 拆到 per-frame batch 后, 每个 (b, t) sample 也都用对应 b 的同一个 t_emb,
+        # 所以把 t_emb 显式 expand 到 (B, T, D) 再合并 batch 维.
+        t_emb = t_embedding_B_T_D
+        if t_emb.shape[1] != T:
+            if t_emb.shape[1] == 1:
+                t_emb = t_emb.expand(B, T, t_emb.shape[-1])
+            else:
+                raise ValueError(
+                    f"t_embedding_B_T_D shape mismatch: expected dim1 == 1 or {T}, got {tuple(t_emb.shape)}"
+                )
+        emb_BT_1_D = rearrange(t_emb, "b t d -> (b t) 1 d")
+
+        # ── 调用同构 Cosmos Block, cross-attn K/V = 当前 latent t 的 PC token ──
+        block = self.adapter_blocks[adapter_idx]
+        out_BT_1_H_W_D = block(
+            x_BT_1_H_W_D,
+            emb_BT_1_D,
+            pc_feat_BT_K_da,            # crossattn_emb 替换为 PC tokens [B*T, K, D]
+            rope_emb_L_1_1_D=None,      # adapter 内部 self-attn 不需要 RoPE (per-frame spatial)
+            adaln_lora_B_T_3D=None,     # use_adaln_lora=False (跟 backbone 配置一致)
+            extra_per_block_pos_emb=None,
+        )
+
+        # delta = Block(x) - x; adaLN-zero 保证初始 delta ≈ 0
+        delta_BT_1_H_W_D = out_BT_1_H_W_D - x_BT_1_H_W_D
+        delta_B_T_H_W_D = rearrange(delta_BT_1_H_W_D, "(b t) 1 h w d -> b t h w d", b=B, t=T)
+
+        # ── frame-level mask: PC 不可见的帧强制 0 (prefix 后段 / none mode) ──
+        # cross-attn 内部 K/V padding 全 False 时 softmax 可能数值不稳, 这里用乘法显式截断.
+        if pc_mask_BT_K is not None:
+            frame_visible_BT = pc_mask_BT_K.any(dim=-1).to(delta_B_T_H_W_D.dtype)  # [B*T]
+            frame_visible_B_T = rearrange(frame_visible_BT, "(b t) -> b t", b=B, t=T)
+            delta_B_T_H_W_D = delta_B_T_H_W_D * frame_visible_B_T[:, :, None, None, None]
+
+        # PC tokens 在各 stage 之间不更新, 直接 passthrough.
+        # (与原版"PC 通过 adapter chain 串行更新"不同; PC 视作固定 prior.)
+        return pc_feat_BT_K_da, delta_B_T_H_W_D
+
+    # forward 接口保留, 但 backbone 实际只 call apply_stage. 留作 standalone debugging.
     def forward(
         self,
         pc_latent: torch.Tensor,                # [B, T_pc, K, D_pc]
-        pc_mask: Optional[torch.Tensor],        # [B, T_pc, K] bool 或 None
-        main_block_outputs: List[torch.Tensor], # 每个注入点前一个 block 的输出
-                                                # 每个元素: [B, T, H, W, D_main]
+        pc_mask: Optional[torch.Tensor],        # [B, T_pc, K] 或 None
+        main_block_outputs: List[torch.Tensor], # 每个元素 [B, T, H, W, D_main]
         t_embedding_B_T_D: Optional[torch.Tensor] = None,
         crossattn_emb: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
-        """
-        Args:
-            pc_latent:          点云 latent，[B, T_pc, K, D_pc]
-            pc_mask:            点云有效掩码，[B, T_pc, K]，True 表示有效点；可为 None
-            main_block_outputs: 长度为 num_adapter_blocks 的列表，
-                                第 i 个元素是主干第 inject_block_ids[i] 个 block
-                                执行完毕后的特征 [B, T, H, W, D_main]
-
-        Returns:
-            residuals: 长度为 num_adapter_blocks 的列表，
-                       第 i 个元素是要加到主干第 inject_block_ids[i] 输出上的残差
-                       shape: [B, T, H, W, D_main]
-        """
-        assert len(main_block_outputs) == self.num_adapter_blocks, (
-            f"期望 {self.num_adapter_blocks} 个主干输出，实际收到 {len(main_block_outputs)} 个"
-        )
-
-        B, T_pc, K, D_pc = pc_latent.shape
-        # 取第一个主干输出推断 T, H, W
-        B_, T, H, W, D_main = main_block_outputs[0].shape
+        assert len(main_block_outputs) == self.num_adapter_blocks
+        B, T_pc, K, _ = pc_latent.shape
+        B_, T, H, W, _ = main_block_outputs[0].shape
         assert B_ == B
 
-        # ── Step 1: PC Encoder：[B, T_pc, K, D_pc] → [B, T_pc, K, d_a] ──────
-        pc_feat = self.pc_encoder(pc_latent)                    # [B, T_pc, K, d_a]
+        # PC encode + temporal align
+        pc_feat = self.pc_encoder(pc_latent)
+        pc_feat = self._align_temporal(pc_feat, T)
+        pc_feat_BT_K_da = rearrange(pc_feat, "b t k d -> (b t) k d")
 
-        # ── Step 2: 时间对齐：T_pc → T ─────────────────────────────────────
-        pc_feat = self._align_temporal(pc_feat, T)              # [B, T, K, d_a]
-
-        # 同步对齐 mask
+        # mask 时间对齐
+        pc_mask_BT_K: Optional[torch.Tensor] = None
         if pc_mask is not None:
-            # mask: [B, T_pc, K] → [B, T, K]
-            # 用最近邻插值保持 bool 语义
-            pc_mask_float = pc_mask.float()                     # [B, T_pc, K]
+            pc_mask_float = pc_mask.float()
             pc_mask_BK_T = rearrange(pc_mask_float, "b t k -> (b k) 1 t")
             if T_pc != T:
-                pc_mask_BK_T = F.interpolate(
-                    pc_mask_BK_T, size=T, mode="nearest"
-                )
+                pc_mask_BK_T = F.interpolate(pc_mask_BK_T, size=T, mode="nearest")
             pc_mask_aligned = rearrange(
                 pc_mask_BK_T, "(b k) 1 t -> b t k", b=B, k=K
-            ).bool()                                            # [B, T, K]
-        else:
-            pc_mask_aligned = None
+            ).bool()
+            pc_mask_BT_K = rearrange(pc_mask_aligned, "b t k -> (b t) k")
 
-        # ── Step 3: 逐注入点处理 ────────────────────────────────────────────
-        residuals = []
-
-        # pc_feat 在各 Adapter Block 之间串行传递（类似 ControlNet 的特征链）
-        pc_feat_BT_K_da = rearrange(pc_feat, "b t k d -> (b t) k d")   # [B*T, K, d_a]
-        if pc_mask_aligned is not None:
-            pc_mask_BT_K = rearrange(pc_mask_aligned, "b t k -> (b t) k")  # [B*T, K]
-        else:
-            pc_mask_BT_K = None
-
+        residuals: List[torch.Tensor] = []
         for i, x_main in enumerate(main_block_outputs):
             pc_feat_BT_K_da, residual = self.apply_stage(
                 adapter_idx=i,
@@ -270,60 +285,3 @@ class PointAdapter(nn.Module):
             )
             residuals.append(residual)
         return residuals
-
-    def apply_stage(
-        self,
-        adapter_idx: int,
-        pc_feat_BT_K_da: torch.Tensor,
-        pc_mask_BT_K: Optional[torch.Tensor],
-        x_main: torch.Tensor,
-        t_embedding_B_T_D: Optional[torch.Tensor] = None,
-        crossattn_emb: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply one injection stage and return updated pc features plus residual."""
-        B, T, H, W, _ = x_main.shape
-        
-        if t_embedding_B_T_D is None or crossattn_emb is None:
-            raise ValueError("Cosmos Block adapter requires t_embedding_B_T_D and crossattn_emb")
-        
-        stage_blocks = self.adapter_blocks[adapter_idx]
-        c_B_T_1_K_da = rearrange(pc_feat_BT_K_da, "(b t) k d -> b t 1 k d", b=B, t=T)
-        # 与 GeoAdapter 一致：仅首个 stage 用 before_proj 将主干信息注入 adapter 分支。
-        if adapter_idx == 0:
-            x_global_B_T_da = self.x_proj(x_main).mean(dim=(2, 3))
-            x_global_B_T_1_1_da = rearrange(x_global_B_T_da, "b t d -> b t 1 1 d")
-            c_B_T_1_K_da = self.before_proj(c_B_T_1_K_da) + x_global_B_T_1_1_da
-
-        emb_B_T_da = self.t_proj(t_embedding_B_T_D)
-
-        adapter_context = crossattn_emb[0] if isinstance(crossattn_emb, tuple) else crossattn_emb
-
-        for block in stage_blocks:
-            c_B_T_1_K_da = block(
-                c_B_T_1_K_da,
-                emb_B_T_da,
-                adapter_context,
-                rope_emb_L_1_1_D=None,
-                adaln_lora_B_T_3D=None,
-                extra_per_block_pos_emb=None,
-            )
-
-        if pc_mask_BT_K is not None:
-            pc_mask_B_T_K = rearrange(pc_mask_BT_K, "(b t) k -> b t k", b=B, t=T)
-            c_B_T_1_K_da = c_B_T_1_K_da * pc_mask_B_T_K[:, :, None, :, None].to(c_B_T_1_K_da.dtype)
-        else:
-            pc_mask_B_T_K = None
-
-        c_skip_B_T_1_K_D = self.after_projs[adapter_idx](c_B_T_1_K_da)
-        c_skip_B_T_K_D = c_skip_B_T_1_K_D.squeeze(2)
-
-        if pc_mask_B_T_K is not None:
-            mask_B_T_K_1 = pc_mask_B_T_K[:, :, :, None].to(c_skip_B_T_K_D.dtype)
-            valid_count = mask_B_T_K_1.sum(dim=2).clamp(min=1.0)
-            pc_global_B_T_D = (c_skip_B_T_K_D * mask_B_T_K_1).sum(dim=2) / valid_count
-        else:
-            pc_global_B_T_D = c_skip_B_T_K_D.mean(dim=2)
-
-        residual = pc_global_B_T_D[:, :, None, None, :].expand(-1, -1, H, W, -1)
-        pc_feat_next = rearrange(c_B_T_1_K_da.squeeze(2), "b t k d -> (b t) k d")
-        return pc_feat_next, residual
