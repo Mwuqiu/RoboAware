@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--experiment",
-        default="predict2_point_adapter_training_2b_cosmos_so100_point",
+        default="predict2_point_adapter_training_2b_world_arena_precomputed_pc_conditioning",
         help="Experiment override to instantiate the Point Adapter architecture.",
     )
     parser.add_argument("--pointcept-k", type=int, default=30)
@@ -306,6 +306,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pointcept-pad-value", type=float, default=0.0)
     parser.add_argument("--pointcept-amp", action="store_true")
     parser.add_argument("--pointcept-grid-size", type=float, default=0.005)
+    # Pointcept encoder identity - MUST match what was used to dump the
+    # training pc_latent (otherwise pc_latent distribution drifts and the
+    # adapter sees out-of-distribution PC features at inference time).
+    parser.add_argument("--pointcept-dataset", default="robotwin",
+                        help="Pointcept DATASET key (matches Pointcept/configs/<DATASET>/...).")
+    parser.add_argument("--pointcept-config", default="semseg-pt-v3m1-0-base",
+                        help="Pointcept CONFIG file stem.")
+    parser.add_argument("--pointcept-exp-name", default="semseg-pt-v3m1-0-base-cosmos-pcenc",
+                        help="Pointcept EXP_NAME (subdir under exp/<DATASET>/).")
+    parser.add_argument("--pointcept-weight-name", default="model_last",
+                        help="Pointcept WEIGHT_NAME (filename stem under exp/.../model/).")
     return parser.parse_args()
 
 
@@ -343,6 +354,12 @@ def main() -> None:
         pc_latent_pad_value=args.pointcept_pad_value,
         pc_latent_amp=args.pointcept_amp,
         pc_latent_grid_size=args.pointcept_grid_size,
+        pc_encoder_config=dict(
+            DATASET=args.pointcept_dataset,
+            CONFIG=args.pointcept_config,
+            EXP_NAME=args.pointcept_exp_name,
+            WEIGHT_NAME=args.pointcept_weight_name,
+        ),
     )
     batch = _build_single_batch(
         dataset=dataset,
