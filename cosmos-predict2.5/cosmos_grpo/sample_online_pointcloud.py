@@ -164,13 +164,29 @@ def _ensure_point_conditioning_dtype(model, data_batch: dict[str, Any]) -> None:
 
 
 def _validate_conditioning_keys(data_batch: dict[str, Any]) -> None:
-    required = ["pc_latent_x0", "pc_latent_mask", "t5_text_embeddings", "t5_text_mask"]
+    required = [
+        "video",
+        "padding_mask",
+        "num_conditional_frames",
+        "pc_latent_x0",
+        "pc_latent_mask",
+        "t5_text_embeddings",
+        "t5_text_mask",
+    ]
     missing = [k for k in required if data_batch.get(k) is None]
     if missing:
         raise RuntimeError(
             "Missing conditioning fields in batch: "
             f"{missing}. Available keys: {sorted(list(data_batch.keys()))}"
         )
+
+    video = data_batch["video"]
+    if not isinstance(video, torch.Tensor) or video.ndim != 5:
+        raise RuntimeError(f"Expected video tensor [B,C,T,H,W], got {type(video)} {getattr(video, 'shape', None)}")
+    ncond = data_batch["num_conditional_frames"]
+    ncond_value = int(ncond.flatten()[0].item()) if isinstance(ncond, torch.Tensor) else int(ncond)
+    if ncond_value < 0 or ncond_value >= video.shape[2]:
+        raise RuntimeError(f"num_conditional_frames={ncond_value} is invalid for T={video.shape[2]}")
 
 
 def _get_video_chunk_at(
@@ -213,10 +229,14 @@ def _build_single_batch(
     video_path: str,
     episode_id: str,
     start_frame: int | None,
+    num_conditional_frames: int,
 ) -> dict[str, Any]:
     if start_frame is None:
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-        return next(iter(loader))
+        data = next(iter(loader))
+        data["dataset_name"] = "video_data"
+        data["num_conditional_frames"] = torch.tensor([num_conditional_frames], dtype=torch.int64)
+        return data
 
     # Build a deterministic sample at fixed start_frame using dataset internals.
     video, fps = _get_video_chunk_at(
@@ -243,11 +263,13 @@ def _build_single_batch(
     data["episode_id"] = [episode_id]
     data["video_basename"] = [episode_id]
     data["video_path"] = [video_path]
+    data["dataset_name"] = "video_data"
     data["video"] = video.unsqueeze(0)
     data["ai_caption"] = [caption]
     data["fps"] = torch.tensor([fps], dtype=torch.float32)
     data["image_size"] = torch.tensor([[h, w, h, w]], dtype=torch.int64)
     data["num_frames"] = torch.tensor([dataset.sequence_length], dtype=torch.int64)
+    data["num_conditional_frames"] = torch.tensor([num_conditional_frames], dtype=torch.int64)
     data["padding_mask"] = torch.zeros((1, 1, h, w), dtype=torch.float32)
     return data
 
@@ -283,6 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shift", type=float, default=5.0)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--num-frames", type=int, default=93)
+    parser.add_argument("--num-conditional-frames", type=int, default=1)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument(
@@ -317,6 +340,11 @@ def parse_args() -> argparse.Namespace:
                         help="Pointcept EXP_NAME (subdir under exp/<DATASET>/).")
     parser.add_argument("--pointcept-weight-name", default="model_last",
                         help="Pointcept WEIGHT_NAME (filename stem under exp/.../model/).")
+    parser.add_argument(
+        "--force-init-frame",
+        action="store_true",
+        help="Overwrite the decoded output's first conditional frames with the input conditioning frames before saving.",
+    )
     return parser.parse_args()
 
 
@@ -366,10 +394,20 @@ def main() -> None:
         video_path=str(video_path),
         episode_id=args.episode_id,
         start_frame=args.start_frame,
+        num_conditional_frames=args.num_conditional_frames,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch = _move_batch_to_device(batch, device)
+    if "dataset_name" not in batch:
+        batch["dataset_name"] = "video_data"
+    if "num_conditional_frames" not in batch:
+        batch["num_conditional_frames"] = torch.tensor([args.num_conditional_frames], dtype=torch.int64, device=device)
+
+    ncond = int(batch["num_conditional_frames"].flatten()[0].item())
+    conditioning_frames_in01 = None
+    if args.force_init_frame and ncond > 0:
+        conditioning_frames_in01 = batch["video"][0, :, :ncond].detach().float().cpu() / 255.0
 
     _ensure_text_conditioning(model, batch)
     _ensure_point_conditioning_dtype(model, batch)
@@ -396,6 +434,9 @@ def main() -> None:
 
     # model.decode output is typically in [-1, 1].
     video_in01 = ((video[0].detach().float().cpu() + 1.0) / 2.0).clamp(0.0, 1.0)
+    if conditioning_frames_in01 is not None:
+        n = min(conditioning_frames_in01.shape[1], video_in01.shape[1])
+        video_in01[:, :n] = conditioning_frames_in01[:, :n].to(dtype=video_in01.dtype)
 
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -423,6 +464,8 @@ def main() -> None:
         "shift": args.shift,
         "fps": args.fps,
         "num_frames": args.num_frames,
+        "num_conditional_frames": ncond,
+        "force_init_frame": bool(args.force_init_frame),
         "resolution": [args.height, args.width],
         "start_frame": start_frame_value,
         "output_mp4": f"{out_stem}.mp4",
@@ -437,3 +480,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
