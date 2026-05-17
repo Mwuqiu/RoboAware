@@ -57,10 +57,6 @@ To enable full experiment tracking with W&B:
     torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
       --config=cosmos_predict2/_src/predict2/configs/video2world/config.py -- \
       experiment=${EXP}
-
-    torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train \
-      --config=cosmos_predict2/_src/predict2/configs/video2world/config.py -- \
-      experiment=predict2_point_adapter_training_2b_cosmos_so100_point
     ```
 
 ### Option 2: Disable W&B

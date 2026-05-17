@@ -397,10 +397,6 @@ class DiffusionModel(ImaginaireModel):
         else:
             raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
 
-        aux_loss = output_batch.get("aux_loss")
-        if aux_loss is not None:
-            kendall_loss = kendall_loss + aux_loss
-
         return output_batch, kendall_loss
 
     @staticmethod

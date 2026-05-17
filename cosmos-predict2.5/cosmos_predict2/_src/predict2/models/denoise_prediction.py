@@ -24,6 +24,4 @@ class DenoisePrediction:
     x0: Optional[torch.Tensor] = None  # clean data prediction
     F: Optional[torch.Tensor] = None  # F prediction in TrigFlow
     velocity: Optional[torch.Tensor] = None  # velocity prediction if using RF
-    pc_x0: Optional[torch.Tensor] = None  # clean point latent prediction
-    pc_velocity: Optional[torch.Tensor] = None  # point velocity prediction if using RF
     intermediate_features: Optional[list[torch.Tensor]] = None

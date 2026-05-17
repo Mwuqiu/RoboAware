@@ -37,7 +37,6 @@ import transformer_engine as te
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
-import torch.nn.functional as F
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
@@ -63,7 +62,7 @@ from cosmos_predict2._src.predict2.modules.neighborhood_attn import Neighborhood
 from cosmos_predict2._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
 from cosmos_predict2._src.predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_predict2._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
-from cosmos_predict2._src.predict2.networks.point_adapter import PointAdapter
+
 
 # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
 def predict2_2B_720_context_fn():
@@ -1128,67 +1127,6 @@ class FinalLayer(nn.Module):
         return x_B_T_H_W_O
 
 
-class PointCloudTemporalCompressor(nn.Module):
-    
-    def __init__(self, d_in: int, d_hidden: int | None = None):
-        super().__init__()
-        _d_hidden = d_hidden if d_hidden is not None else d_in
-        self.gru = nn.GRU(
-            input_size=d_in,
-            hidden_size=_d_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        if _d_hidden != d_in:
-            self.proj = nn.Linear(_d_hidden, d_in, bias=False)
-        else:
-            self.proj = nn.Identity()
-        
-        self.d_in = d_in
-        self.d_hidden = _d_hidden
-
-    
-    def forward(
-        self,
-        pc_B_Tpc_K_D: torch.Tensor,
-        pc_mask_B_Tpc_K: torch.Tensor | None,
-        Tx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        
-        B, Tpc, K, D = pc_B_Tpc_K_D.shape
-        assert D == self.d_in, f"d_in mismatch: {D} vs {self.d_in}"
-        assert Tx >= 1
-
-        if Tx == 1:
-            cutoff = torch.zeros(1, device=pc_B_Tpc_K_D.device, dtype=torch.long)
-        else:
-            cutoff = torch.linspace(
-                0, Tpc - 1, steps=Tx,
-                device=pc_B_Tpc_K_D.device,
-            ).round().long()
-        
-        if pc_mask_B_Tpc_K is not None:
-            mask_expanded = pc_mask_B_Tpc_K.to(pc_B_Tpc_K_D.dtype).unsqueeze(-1)  # [B,Tpc,K,1]
-            pc_B_Tpc_K_D = pc_B_Tpc_K_D * mask_expanded
-        
-        x = pc_B_Tpc_K_D.permute(0, 2, 1, 3).reshape(B * K, Tpc, D)
-        h_seq, _ = self.gru(x)
-        y = self.proj(h_seq)
-
-        y = y[:, cutoff, :] # [(B*K), Tx, D]
-        y = y.reshape(B, K, Tx, D).permute(0, 2, 1, 3).contiguous()  # [B, Tx, K, D]
-
-        if pc_mask_B_Tpc_K is None:
-            m_out = None
-        else:
-            assert pc_mask_B_Tpc_K.shape == (B, Tpc, K), (
-                f"pc_mask shape mismatch: {tuple(pc_mask_B_Tpc_K.shape)} vs [B={B},Tpc={Tpc},K={K}]"
-            )
-            m_out = pc_mask_B_Tpc_K[:, cutoff, :].contiguous()  # [B, Tx, K] bool
-
-        return y, m_out
-
-
 class Block(nn.Module):
     """
     A transformer block that combines self-attention, cross-attention and MLP layers with AdaLN modulation.
@@ -1443,192 +1381,6 @@ class Block(nn.Module):
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
         return x_B_T_H_W_D
 
-    # def forward(
-    #     self,
-    #     x_B_T_H_W_D: torch.Tensor,
-    #     emb_B_T_D: torch.Tensor,
-    #     crossattn_emb: torch.Tensor,
-    #     rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
-    #     adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
-    #     extra_per_block_pos_emb: Optional[torch.Tensor] = None,
-    #     kv_cache_cfg: Optional[KVCacheConfig] = None,
-    #     pc_context: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
-    # ) -> torch.Tensor:
-    #     if extra_per_block_pos_emb is not None:
-    #         x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
-
-    #     with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
-    #         if self.use_adaln_lora:
-    #             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-    #                 self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-    #             ).chunk(3, dim=-1)
-    #             shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-    #                 self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-    #             ).chunk(3, dim=-1)
-    #             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-    #                 self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-    #             ).chunk(3, dim=-1)
-    #         else:
-    #             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
-    #                 emb_B_T_D
-    #             ).chunk(3, dim=-1)
-    #             shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-    #                 self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
-    #             )
-    #             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
-
-    #     # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
-    #     shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     scale_self_attn_B_T_1_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     gate_self_attn_B_T_1_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-
-    #     shift_cross_attn_B_T_1_1_D = rearrange(shift_cross_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     scale_cross_attn_B_T_1_1_D = rearrange(scale_cross_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     gate_cross_attn_B_T_1_1_D = rearrange(gate_cross_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-
-    #     shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-    #     gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-
-    #     B, T, H, W, D = x_B_T_H_W_D.shape
-
-    #     def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
-    #         return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
-
-    #     normalized_x_B_T_H_W_D = _fn(
-    #         x_B_T_H_W_D,
-    #         self.layer_norm_self_attn,
-    #         scale_self_attn_B_T_1_1_D,
-    #         shift_self_attn_B_T_1_1_D,
-    #     )
-
-    #     video_size = VideoSize(T=T, H=H, W=W)
-
-    #     # (ahassani): Hack to correct `video_size` when CP is enabled.
-    #     # I really don't like this, but there doesn't seem to be any central
-    #     # piece of code that's responsible for handling CP/TP that also defines the
-    #     # layout of shardings. Other parts of the code (i.e. RoPE) seem to make this
-    #     # assumption that CP sharding is always done along T.
-    #     if self.cp_size is not None and self.cp_size > 1:
-    #         video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
-
-    #     result_B_T_H_W_D = rearrange(
-    #         self.self_attn(
-    #             # normalized_x_B_T_HW_D,
-    #             rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-    #             None,
-    #             rope_emb=rope_emb_L_1_1_D,
-    #             video_size=video_size,
-    #             kv_cache_cfg=kv_cache_cfg,
-    #         ),
-    #         "b (t h w) d -> b t h w d",
-    #         t=T,
-    #         h=H,
-    #         w=W,
-    #     )
-    #     x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
-
-
-    #     def _x_fn(
-    #         _x_B_T_H_W_D,
-    #         _norm_layer,
-    #         _scale_B_T_1_1_D,
-    #         _shift_B_T_1_1_D,
-    #         _gate_B_T_1_1_D,
-    #     ):
-    #         _normalized = _fn(
-    #             _x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D   
-    #         )
-    #         pc_latent, pc_mask = pc_context if pc_context is not None else (None, None)
-    #         has_pc = pc_latent is not None
-
-    #         is_tuple = isinstance(crossattn_emb, tuple)
-    #         if is_tuple:
-    #             text_ctx, img_ctx = crossattn_emb   # text:[B,L,D]  img:[B,Li,D]
-    #         else:
-    #             text_ctx = crossattn_emb            # [B,L,D]
-    #             img_ctx = None
-            
-    #         if has_pc:
-    #             L = text_ctx.shape[1]
-    #             K = pc_latent.shape[2]
-
-    #             q_BT_HW_D = rearrange(_normalized, "b t h w d -> (b t) (h w) d")
-
-    #             # text_ctx: [B,L,D] → [B*T, L, D]
-    #             text_ctx_BT = rearrange(
-    #                 text_ctx.unsqueeze(1).expand(-1, T, -1, -1),
-    #                 "b t l d -> (b t) l d",
-    #             )
-
-    #             # pc_latent: [B,T,K,D] → [B*T, K, D]
-    #             pc_BT = rearrange(pc_latent, "b t k d -> (b t) k d").to(text_ctx_BT.dtype)
-
-    #             if pc_mask is not None:
-    #                 # pc_mask: [B,T,K] bool → [B*T, K]
-    #                 pc_mask_BT = rearrange(pc_mask.to(torch.bool), "b t k -> (b t) k")
-    #                 pc_BT = pc_BT * pc_mask_BT[:, :, None].to(pc_BT.dtype)
-
-    #             # ctx: [B*T, L+K, D]
-    #             ctx_BT = torch.cat([text_ctx_BT, pc_BT], dim=1)
-
-    #             if img_ctx is not None:
-    #                 img_ctx_BT = rearrange(
-    #                     img_ctx.unsqueeze(1).expand(-1, T, -1, -1),
-    #                     "b t l d -> (b t) l d",
-    #                 ).to(text_ctx_BT.dtype)
-    #                 ctx_BT = torch.cat([ctx_BT, img_ctx_BT], dim=1)
-
-    #             out_BT_HW_D = self.cross_attn(
-    #                 q_BT_HW_D,
-    #                 ctx_BT,
-    #                 rope_emb=None,
-    #             )
-
-    #             _result = rearrange(
-    #                 out_BT_HW_D,
-    #                 "(b t) (h w) d -> b t h w d",
-    #                 b=B, t=T, h=H, w=W,
-    #             )
-    #         else:
-    #             q_B_THW_D = rearrange(_normalized, "b t h w d -> b (t h w) d")
-                
-    #             if is_tuple:
-    #                 ctx = crossattn_emb
-    #             else:
-    #                 ctx = crossattn_emb
-
-    #             out_B_THW_D = self.cross_attn(
-    #                 q_B_THW_D,
-    #                 ctx,
-    #                 rope_emb=None,
-    #             )
-    #             _result = rearrange(
-    #                 out_B_THW_D,
-    #                 "b (t h w) d -> b t h w d",
-    #                 t=T, h=H, w=W,
-    #             )
-    #         return _result
-
-    #     result_B_T_H_W_D = _x_fn(
-    #         x_B_T_H_W_D,
-    #         self.layer_norm_cross_attn,
-    #         scale_cross_attn_B_T_1_1_D,
-    #         shift_cross_attn_B_T_1_1_D,
-    #         gate_cross_attn_B_T_1_1_D,
-    #     )
-    #     x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
-
-    #     normalized_x_B_T_H_W_D = _fn(
-    #         x_B_T_H_W_D,
-    #         self.layer_norm_mlp,
-    #         scale_mlp_B_T_1_1_D,
-    #         shift_mlp_B_T_1_1_D,
-    #     )
-    #     result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
-    #     x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
-    #     return x_B_T_H_W_D
-
 
 class MiniTrainDIT(WeightTrainingStat):
     """
@@ -1731,14 +1483,6 @@ class MiniTrainDIT(WeightTrainingStat):
         sac_config: SACConfig = SACConfig(),
         n_dense_blocks: int = -1,
         natten_parameters: Union[dict, list] = None,
-        point_adapter_d_a: Optional[int] = None,
-        point_adapter_num_adapter_blocks: int = 7,
-        point_adapter_block_depth: int = 1,
-        point_adapter_num_heads: Optional[int] = None,
-        point_adapter_inject_block_ids: Optional[List[int]] = None,
-        point_adapter_inject_every_k: int = 4,
-        point_adapter_mlp_ratio: Optional[float] = None,
-        point_adapter_dropout: float = 0.0,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
     ) -> None:
@@ -1832,38 +1576,6 @@ class MiniTrainDIT(WeightTrainingStat):
             self = replace_selfattn_op_with_sparse_attn_op(self, n_dense_blocks, natten_parameters=natten_parameters)
 
         self._is_context_parallel_enabled = False
-
-        # self.pc_time_compressor = PointCloudTemporalCompressor(d_in=crossattn_emb_channels)
-
-        adapter_num_heads = num_heads if point_adapter_num_heads is None else point_adapter_num_heads
-        adapter_mlp_ratio = mlp_ratio if point_adapter_mlp_ratio is None else point_adapter_mlp_ratio
-        adapter_dim = model_channels if point_adapter_d_a is None else point_adapter_d_a
-
-        self.point_adapter = PointAdapter(
-            d_pc=crossattn_emb_channels,   # 点云 latent 原始维度，与 crossattn_emb 同维
-            d_main=model_channels,         # 主干维度 8192
-            d_a=adapter_dim,
-            num_adapter_blocks=point_adapter_num_adapter_blocks,
-            adapter_block_depth=point_adapter_block_depth,
-            num_heads=adapter_num_heads,
-            inject_block_ids=point_adapter_inject_block_ids,
-            inject_every_k=point_adapter_inject_every_k,
-            num_main_blocks=num_blocks,    # 主干总 block 数 28
-            mlp_ratio=adapter_mlp_ratio,
-            dropout=point_adapter_dropout,
-            block_factory=Block,
-            block_factory_kwargs=dict(
-                context_dim=crossattn_emb_channels,
-                num_heads=adapter_num_heads,
-                mlp_ratio=adapter_mlp_ratio,
-                use_adaln_lora=False,
-                adaln_lora_dim=adaln_lora_dim,
-                backend=atten_backend,
-                image_context_dim=None,
-                use_wan_fp32_strategy=use_wan_fp32_strategy,
-            ),
-        )
-
 
     def init_weights(self):
         self.x_embedder.init_weights()
@@ -1997,115 +1709,6 @@ class MiniTrainDIT(WeightTrainingStat):
         )
         return x_B_C_Tt_Hp_Wp
 
-    # def forward(
-    #     self,
-    #     x_B_C_T_H_W: torch.Tensor,
-    #     timesteps_B_T: torch.Tensor,
-    #     crossattn_emb: torch.Tensor,
-    #     fps: Optional[torch.Tensor] = None,
-    #     padding_mask: Optional[torch.Tensor] = None,
-    #     data_type: Optional[DataType] = DataType.VIDEO,
-    #     intermediate_feature_ids: Optional[List[int]] = None,
-    #     img_context_emb: Optional[torch.Tensor] = None,
-    #     pc_latent_x0: Optional[torch.Tensor] = None,
-    #     pc_latent_mask: Optional[torch.Tensor] = None,
-    # ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
-    #     """
-    #     Args:
-    #         x: (B, C, T, H, W) tensor of spatial-temp inputs
-    #         timesteps: (B, ) tensor of timesteps
-    #         crossattn_emb: (B, N, D) tensor of cross-attention embeddings
-    #     """
-    #     assert isinstance(data_type, DataType), (
-    #         f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
-    #     )
-    #     x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
-    #         x_B_C_T_H_W,
-    #         fps=fps,
-    #         padding_mask=padding_mask,
-    #     )
-
-    #     if self.use_crossattn_projection:
-    #         crossattn_emb = self.crossattn_proj(crossattn_emb)
-        
-    #     # if pc_latent_x0 is not None:
-    #     #     Bx, Tx = x_B_T_H_W_D.shape[0], x_B_T_H_W_D.shape[1]
-
-    #     #     assert pc_latent_x0.ndim == 4, \
-    #     #         f"expected pc [B,Tpc,K,D], got {tuple(pc_latent_x0.shape)}"
-    #     #     assert pc_latent_x0.shape[0] == Bx
-
-    #     #     pc_latent_x0, pc_latent_mask = self.pc_time_compressor(
-    #     #         pc_latent_x0, pc_latent_mask, Tx=Tx
-    #     #     )
-
-    #     #     pc_context = (pc_latent_x0, pc_latent_mask)
-    #     # else:
-    #     #     pc_context = (None, None)
-
-
-    #     if img_context_emb is not None:
-    #         assert self.extra_image_context_dim is not None, (
-    #             "extra_image_context_dim must be set if img_context_emb is provided"
-    #         )
-    #         img_context_emb = self.img_context_proj(img_context_emb)
-    #         context_input = (crossattn_emb, img_context_emb)
-    #     else:
-    #         context_input = crossattn_emb
-
-    #     with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
-    #         if timesteps_B_T.ndim == 1:
-    #             timesteps_B_T = timesteps_B_T.unsqueeze(1)
-    #         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
-    #         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
-
-    #     # for logging purpose
-    #     affline_scale_log_info = {}
-    #     affline_scale_log_info["t_embedding_B_T_D"] = t_embedding_B_T_D.detach()
-    #     self.affline_scale_log_info = affline_scale_log_info
-    #     self.affline_emb = t_embedding_B_T_D
-    #     self.crossattn_emb = crossattn_emb
-
-    #     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-    #         assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
-    #             f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
-    #         )
-
-    #     B, T, H, W, D = x_B_T_H_W_D.shape
-    #     # x_B_THW_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
-        
-
-    #     intermediate_features_outputs = []
-    #     for i, block in enumerate(self.blocks):
-    #         x_B_T_H_W_D = block(
-    #             x_B_T_H_W_D,
-    #             t_embedding_B_T_D,
-    #             context_input,
-    #             rope_emb_L_1_1_D=rope_emb_L_1_1_D,
-    #             adaln_lora_B_T_3D=adaln_lora_B_T_3D,
-    #             extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-    #             pc_context=pc_context,
-    #         )
-    #         if intermediate_feature_ids and i in intermediate_feature_ids:
-    #             x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
-    #             intermediate_features_outputs.append(x_reshaped_for_disc)
-
-    #     # x_B_T_H_W_D = rearrange(x_B_THW_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-    #     # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
-    #     x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-    #     x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
-    #     if intermediate_feature_ids:
-    #         if len(intermediate_features_outputs) != len(intermediate_feature_ids):
-    #             log.warning(
-    #                 f"Collected {len(intermediate_features_outputs)} intermediate features, "
-    #                 f"but expected {len(intermediate_feature_ids)}. "
-    #                 f"Requested IDs: {intermediate_feature_ids}"
-    #             )
-    #         return x_B_C_Tt_Hp_Wp, intermediate_features_outputs
-
-    #     return x_B_C_Tt_Hp_Wp
-
-
     def forward(
         self,
         x_B_C_T_H_W: torch.Tensor,
@@ -2116,23 +1719,29 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
-        pc_latent_x0: Optional[torch.Tensor] = None,
-        pc_latent_xt: Optional[torch.Tensor] = None,
-        pc_latent_mask: Optional[torch.Tensor] = None,
-        pc_condition_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
-
-        assert isinstance(data_type, DataType)
-
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
-            x_B_C_T_H_W, fps=fps, padding_mask=padding_mask,
+        """
+        Args:
+            x: (B, C, T, H, W) tensor of spatial-temp inputs
+            timesteps: (B, ) tensor of timesteps
+            crossattn_emb: (B, N, D) tensor of cross-attention embeddings
+        """
+        assert isinstance(data_type, DataType), (
+            f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
+        )
+        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
+            x_B_C_T_H_W,
+            fps=fps,
+            padding_mask=padding_mask,
         )
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
 
         if img_context_emb is not None:
-            assert self.extra_image_context_dim is not None
+            assert self.extra_image_context_dim is not None, (
+                "extra_image_context_dim must be set if img_context_emb is provided"
+            )
             img_context_emb = self.img_context_proj(img_context_emb)
             context_input = (crossattn_emb, img_context_emb)
         else:
@@ -2144,71 +1753,22 @@ class MiniTrainDIT(WeightTrainingStat):
             t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
             t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        # logging
-        self.affline_scale_log_info = {"t_embedding_B_T_D": t_embedding_B_T_D.detach()}
+        # for logging purpose
+        affline_scale_log_info = {}
+        affline_scale_log_info["t_embedding_B_T_D"] = t_embedding_B_T_D.detach()
+        self.affline_scale_log_info = affline_scale_log_info
         self.affline_emb = t_embedding_B_T_D
         self.crossattn_emb = crossattn_emb
 
-        B, T, H, W, D = x_B_T_H_W_D.shape
-
-        # ── PointAdapter 预处理 ──────────────────────────────────────────────────
-        # inject_block_ids 由 PointAdapter 根据 inject_every_k / num_adapter_blocks 动态生成。
-        # 我们需要在主干 block 循环中：
-        #   1. 在每个注入点 block 执行完毕后，收集主干输出
-        #   2. 将收集到的输出批量送入 PointAdapter，得到残差列表
-        #   3. 将残差加回对应 block 的输出
-        #
-        # 由于 PointAdapter 需要「当前 block 输出」才能计算残差，
-        # 我们采用「在线注入」策略：每到注入点，立即调用对应的 adapter_block。
-
-        pc_input = pc_latent_xt if pc_latent_xt is not None else pc_latent_x0
-        use_pc = pc_input is not None
-        if use_pc:
-            assert pc_input.ndim == 4, f"expected point latent shape [B, T_pc, K, D], got {tuple(pc_input.shape)}"
-            assert pc_input.shape[0] == B, \
-                f"batch size mismatch: x={B}, pc={pc_input.shape[0]}"
-
-            # Keep the full point timeline for the point diffusion head; align only a copy for video injection.
-            main_dtype = x_B_T_H_W_D.dtype
-
-            pc_feat_full = self.point_adapter.pc_encoder(pc_input.to(main_dtype))  # [B, T_pc, K, d_a]
-            T_pc = pc_feat_full.shape[1]
-            pc_feat_video = self.point_adapter._align_temporal(pc_feat_full, T)  # [B, T, K, d_a]
-            pc_feat_video_base = pc_feat_video
-
-            if pc_latent_mask is not None:
-                K = pc_input.shape[2]
-                pc_mask_float = pc_latent_mask.float()                      # [B, T_pc, K]
-                pc_mask_BK_T = rearrange(pc_mask_float, "b t k -> (b k) 1 t")
-                if T_pc != T:
-                    pc_mask_BK_T = F.interpolate(pc_mask_BK_T, size=T, mode="nearest")
-                pc_mask_aligned = rearrange(
-                    pc_mask_BK_T, "(b k) 1 t -> b t k", b=B, k=K
-                ).bool()                                                    # [B, T, K]
-            else:
-                pc_mask_aligned = None
-
-            # 转为 [B*T, K, d_a] 供在线注入使用
-            pc_feat_BT = rearrange(pc_feat_video, "b t k d -> (b t) k d")
-            pc_mask_BT = (
-                rearrange(pc_mask_aligned, "b t k -> (b t) k")
-                if pc_mask_aligned is not None else None
+        if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+            assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
+                f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
             )
-        else:
-            pc_feat_BT = None
-            pc_mask_BT = None
 
-        # inject_block_ids set，用于 O(1) 查找
-        inject_id_set = set(self.point_adapter.inject_block_ids) if use_pc else set()
-        # 建立 inject_block_id → adapter_block 索引的映射
-        inject_id_to_adapter_idx = (
-            {bid: idx for idx, bid in enumerate(self.point_adapter.inject_block_ids)}
-            if use_pc else {}
-        )
+        B, T, H, W, D = x_B_T_H_W_D.shape
+        # x_B_THW_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
-        # ── 主干 Block 循环（在线注入）───────────────────────────────────────────
         intermediate_features_outputs = []
-
         for i, block in enumerate(self.blocks):
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
@@ -2216,43 +1776,16 @@ class MiniTrainDIT(WeightTrainingStat):
                 context_input,
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
-                extra_per_block_pos_emb=extra_pos_emb,
+                extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
             )
-
-            # ── PointAdapter 在线注入 ────────────────────────────────────────────
-            if use_pc and i in inject_id_set:
-                adapter_idx = inject_id_to_adapter_idx[i]
-                pc_feat_BT, residual = self.point_adapter.apply_stage(
-                    adapter_idx=adapter_idx,
-                    pc_feat_BT_K_da=pc_feat_BT,
-                    pc_mask_BT_K=pc_mask_BT,
-                    x_main=x_B_T_H_W_D,
-                    t_embedding_B_T_D=t_embedding_B_T_D,
-                    crossattn_emb=context_input,
-                )
-
-                # 零初始化残差注入：训练初期 zero_proj 输出为 0，不影响主干
-                x_B_T_H_W_D = x_B_T_H_W_D + residual
-
-            # ── 中间特征收集 ─────────────────────────────────────────────────────
             if intermediate_feature_ids and i in intermediate_feature_ids:
-                intermediate_features_outputs.append(
-                    rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
-                )
+                x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
+                intermediate_features_outputs.append(x_reshaped_for_disc)
 
-        # ── Final Layer ──────────────────────────────────────────────────────────
+        # x_B_T_H_W_D = rearrange(x_B_THW_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+        # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
-        if use_pc:
-            pc_feat_video_out = rearrange(pc_feat_BT, "(b t) k d -> b t k d", b=B, t=T)
-            pc_feat_video_delta = pc_feat_video_out - pc_feat_video_base
-            pc_feat_head = pc_feat_full + self.point_adapter._align_temporal(pc_feat_video_delta, T_pc)
-            pc_pred = self.point_adapter.predict_pc(
-                rearrange(pc_feat_head, "b t k d -> (b t) k d"), B=B, T=T_pc
-            )
-        else:
-            pc_pred = None
-
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
                 log.warning(
@@ -2261,9 +1794,6 @@ class MiniTrainDIT(WeightTrainingStat):
                     f"Requested IDs: {intermediate_feature_ids}"
                 )
             return x_B_C_Tt_Hp_Wp, intermediate_features_outputs
-
-        if pc_pred is not None:
-            return x_B_C_Tt_Hp_Wp, pc_pred
 
         return x_B_C_Tt_Hp_Wp
 

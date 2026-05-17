@@ -1,7 +1,0 @@
-{
-    "inference_type": "image2world",
-    "name": "so100_pick_exp",
-    "prompt_path": "so100_pick_exp.txt",
-    "input_path": "so100_pick_exp1.jpg",
-    "resolution": "512,512"
-}

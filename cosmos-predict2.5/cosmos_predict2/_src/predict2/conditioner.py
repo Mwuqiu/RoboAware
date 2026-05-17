@@ -394,28 +394,6 @@ class BooleanFlag(AbstractEmbModel):
         return f"Output key: {key} \n\t This is a boolean flag"
 
 
-class PcLatentRemapDrop(AbstractEmbModel):
-    def __init__(self, input_key: List[str], dropout_rate: float = 0.0):
-        super().__init__()
-        self._input_key = input_key  # ["pc_latent_x0", "pc_latent_mask"]
-        self._dropout_rate = dropout_rate
-        self._keep = None
-
-    def random_dropout_input(self, in_tensor, dropout_rate=None, key=None):
-        dropout_rate = dropout_rate if dropout_rate is not None else self.dropout_rate
-        B = in_tensor.shape[0]
-        if self._keep is None or self._keep.shape[0] != B or self._keep.device != in_tensor.device:
-            self._keep = torch.bernoulli((1.0 - dropout_rate) * torch.ones(B, device=in_tensor.device))
-        keep = self._keep.view(B, *[1]*(in_tensor.dim()-1)).type_as(in_tensor)
-        return keep * in_tensor
-
-    def forward(self, pc_latent_x0, pc_latent_mask=None):
-        out = {"pc_latent_x0": pc_latent_x0}
-        if pc_latent_mask is not None:
-            out["pc_latent_mask"] = pc_latent_mask
-        self._keep = None
-        return out
-
 class GeneralConditioner(nn.Module, ABC):
     """
     An abstract module designed to handle various embedding models with conditional and unconditional configurations.

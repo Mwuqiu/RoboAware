@@ -1,7 +1,0 @@
-{
-    "inference_type": "video2world",
-    "name": "close_drawer",
-    "input_path": "close_drawer.mp4",
-    "prompt_path": "close_drawer.txt",
-    "resolution": "480,832"
-}

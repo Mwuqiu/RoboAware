@@ -19,7 +19,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import attrs
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from megatron.core import parallel_state
 from torch import Tensor
@@ -55,8 +54,6 @@ class Video2WorldConfig(Text2WorldModelConfig):
     high_sigma_ratio: float = 0.05  # Ratio of high sigma frames
     low_sigma_ratio: float = 0.05  # Ratio of low sigma frames
     conditional_frames_probs: Optional[Dict[int, float]] = None  # Probability distribution for conditional frames
-    point_diffusion_loss_weight: float = 1.0
-    point_condition_frames: int = 2
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -151,9 +148,9 @@ class Video2WorldModel(Text2WorldModel):
                 raise ValueError(f"High sigma strategy {self.config.high_sigma_strategy} is not supported")
         return sigma_B_1, epsilon
 
-    def _denoise_prediction_from_flow_t(
+    def denoise_with_velocity(
         self, noise_x_in_t_space: torch.Tensor, t_B_T: torch.Tensor, condition: Text2WorldCondition
-    ) -> DenoisePrediction:
+    ) -> torch.Tensor:
         """
         This function is used when self.config.use_flowunipc_scheduler is set.
         """
@@ -166,211 +163,10 @@ class Video2WorldModel(Text2WorldModel):
         # our model expects input of sigma and x_sigma, so convert t -> sigma, x_t to x_sigma
         sigma_B_T = t_B_T / (1.0 - t_B_T)
         x_B_C_T_H_W_in_sigma_space = noise_x_in_t_space * (1.0 + rearrange(sigma_B_T, "b t -> b 1 t 1 1"))
-        return self.denoise(x_B_C_T_H_W_in_sigma_space, sigma_B_T, condition)
-
-    def denoise_with_velocity(
-        self, noise_x_in_t_space: torch.Tensor, t_B_T: torch.Tensor, condition: Text2WorldCondition
-    ) -> torch.Tensor:
-        denoise_output = self._denoise_prediction_from_flow_t(noise_x_in_t_space, t_B_T, condition)
-        return denoise_output.eps - denoise_output.x0
-
-
-    def _replace_condition_fields(self, condition: Text2WorldCondition, **updates) -> Text2WorldCondition:
-        kwargs = condition.to_dict(skip_underscore=False)
-        kwargs.update({key: value for key, value in updates.items() if key in kwargs})
-        return type(condition)(**kwargs)
-
-    def _align_point_temporal(self, point: torch.Tensor, target_t: int) -> torch.Tensor:
-        if point is None or point.shape[1] == target_t:
-            return point
-
-        if point.ndim == 4:
-            B, T, K, D = point.shape
-            point_BK_D_T = rearrange(point, "b t k d -> (b k) d t")
-            if T > target_t:
-                point_BK_D_T = F.adaptive_avg_pool1d(point_BK_D_T, target_t)
-            else:
-                point_BK_D_T = F.interpolate(point_BK_D_T, size=target_t, mode="linear", align_corners=False)
-            return rearrange(point_BK_D_T, "(b k) d t -> b t k d", b=B, k=K)
-
-        if point.ndim == 3:
-            B, T, K = point.shape
-            is_bool = point.dtype == torch.bool
-            point_BK_1_T = rearrange(point.float(), "b t k -> (b k) 1 t")
-            point_BK_1_T = F.interpolate(point_BK_1_T, size=target_t, mode="nearest")
-            out = rearrange(point_BK_1_T, "(b k) 1 t -> b t k", b=B, k=K)
-            return out.bool() if is_bool else out
-
-        raise ValueError(f"Unsupported point temporal tensor shape: {point.shape}")
-
-    def _prepare_point_diffusion_condition(
-        self,
-        condition: Text2WorldCondition,
-        sigma_B_T: torch.Tensor,
-        ref: torch.Tensor,
-    ) -> tuple[Text2WorldCondition, Optional[dict[str, torch.Tensor]]]:
-        pc_x0 = getattr(condition, "pc_latent_x0", None)
-        if pc_x0 is None:
-            return condition, None
-
-        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype)
-        pc_sigma_B_1 = sigma_B_T.mean(dim=1, keepdim=True).to(device=pc_x0.device, dtype=pc_x0.dtype)
-        pc_epsilon = torch.randn_like(pc_x0)
-        pc_xt = pc_x0 + pc_epsilon * rearrange(pc_sigma_B_1, "b t -> b t 1 1")
-
-        B, T_pc, K, _ = pc_x0.shape
-        n_cond = min(max(int(self.config.point_condition_frames), 0), T_pc)
-        pc_condition_mask = torch.zeros((B, T_pc, K), device=pc_x0.device, dtype=torch.bool)
-        if n_cond > 0:
-            pc_condition_mask[:, :n_cond, :] = True
-            pc_xt = torch.where(pc_condition_mask[..., None], pc_x0, pc_xt)
-
-        point_info = {
-            "pc_x0": pc_x0,
-            "pc_epsilon": pc_epsilon,
-            "pc_sigma_B_1": pc_sigma_B_1,
-            "pc_valid_mask": getattr(condition, "pc_latent_mask", None),
-            "pc_condition_mask": pc_condition_mask,
-        }
-        condition = self._replace_condition_fields(
-            condition,
-            pc_latent_x0=None,
-            pc_latent_xt=pc_xt,
-            pc_condition_mask=pc_condition_mask,
-        )
-        return condition, point_info
-
-    def _point_sampling_condition_tensors(
-        self,
-        point_state: dict[str, torch.Tensor],
-        target_t: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        pc_xt = point_state["pc_xt"]
-        B, _, K, D = pc_xt.shape
-        n_cond = min(int(point_state["n_cond"]), target_t)
-        pc_condition_mask = torch.zeros((B, target_t, K), device=device, dtype=torch.bool)
-        pc_condition_x0 = torch.zeros((B, target_t, K, D), device=device, dtype=dtype)
-
-        pc_condition_prefix = point_state.get("pc_condition_prefix")
-        if n_cond > 0 and pc_condition_prefix is not None:
-            prefix = pc_condition_prefix.to(device=device, dtype=dtype)
-            n_prefix = min(n_cond, prefix.shape[1])
-            pc_condition_mask[:, :n_prefix, :] = True
-            pc_condition_x0[:, :n_prefix, :, :] = prefix[:, :n_prefix, :, :]
-
-        pc_valid_mask = point_state.get("pc_valid_mask_source")
-        if pc_valid_mask is not None:
-            pc_valid_mask = self._align_point_temporal(pc_valid_mask.to(device=device).bool(), target_t)
-
-        return pc_condition_mask, pc_condition_x0, pc_valid_mask
-
-    def _condition_from_point_sampling_state(
-        self,
-        condition: Text2WorldCondition,
-        point_state: dict[str, torch.Tensor],
-    ) -> Text2WorldCondition:
-        pc_xt = point_state["pc_xt"]
-        pc_condition_mask, pc_condition_x0, pc_valid_mask = self._point_sampling_condition_tensors(
-            point_state,
-            pc_xt.shape[1],
-            pc_xt.device,
-            pc_xt.dtype,
-        )
-        pc_xt = torch.where(pc_condition_mask[..., None], pc_condition_x0, pc_xt)
-        point_state["pc_xt"] = pc_xt
-        point_state["pc_condition_mask"] = pc_condition_mask
-        point_state["pc_valid_mask"] = pc_valid_mask
-
-        return self._replace_condition_fields(
-            condition,
-            pc_latent_x0=None,
-            pc_latent_xt=pc_xt,
-            pc_latent_mask=pc_valid_mask,
-            pc_condition_mask=pc_condition_mask,
-        )
-
-    def _prepare_point_sampling_condition(
-        self,
-        condition: Text2WorldCondition,
-        ref: torch.Tensor,
-    ) -> tuple[Text2WorldCondition, Optional[dict[str, torch.Tensor]]]:
-        pc_x0 = getattr(condition, "pc_latent_x0", None)
-        if pc_x0 is None:
-            condition = self._replace_condition_fields(
-                condition,
-                pc_latent_x0=None,
-                pc_latent_xt=None,
-                pc_condition_mask=None,
-            )
-            return condition, None
-
-        pc_x0 = pc_x0.to(device=ref.device, dtype=ref.dtype)
-        B, T_pc, K, _ = pc_x0.shape
-        n_cond = min(max(int(self.config.point_condition_frames), 0), T_pc)
-
-        pc_xt = torch.randn_like(pc_x0)
-        pc_condition_prefix = None
-        if n_cond > 0:
-            pc_condition_prefix = pc_x0[:, :n_cond].clone()
-            pc_xt[:, :n_cond] = pc_condition_prefix
-
-        pc_valid_mask = getattr(condition, "pc_latent_mask", None)
-        if pc_valid_mask is not None:
-            pc_valid_mask = pc_valid_mask.to(device=ref.device).bool()
-
-        point_state = {
-            "pc_xt": pc_xt,
-            "n_cond": n_cond,
-            "pc_valid_mask_source": pc_valid_mask,
-            "pc_condition_prefix": pc_condition_prefix,
-        }
-        condition = self._condition_from_point_sampling_state(condition, point_state)
-        return condition, point_state
-
-    def _update_point_sampling_state(
-        self,
-        point_state: Optional[dict[str, torch.Tensor]],
-        pc_x0_pred: Optional[torch.Tensor],
-    ) -> None:
-        if point_state is None or pc_x0_pred is None:
-            return
-
-        pc_xt = pc_x0_pred.detach()
-        point_state["pc_xt"] = pc_xt
-        pc_condition_mask, pc_condition_x0, pc_valid_mask = self._point_sampling_condition_tensors(
-            point_state,
-            pc_xt.shape[1],
-            pc_xt.device,
-            pc_xt.dtype,
-        )
-        point_state["pc_xt"] = torch.where(pc_condition_mask[..., None], pc_condition_x0, pc_xt)
-        point_state["pc_condition_mask"] = pc_condition_mask
-        point_state["pc_valid_mask"] = pc_valid_mask
-
-    def _point_diffusion_loss(
-        self,
-        point_info: dict[str, torch.Tensor],
-        pc_x0_pred: torch.Tensor,
-    ) -> torch.Tensor:
-        target = self._align_point_temporal(point_info["pc_x0"], pc_x0_pred.shape[1]).to(pc_x0_pred)
-        pc_loss = (target - pc_x0_pred) ** 2
-
-        valid_mask = point_info.get("pc_valid_mask")
-        if valid_mask is not None:
-            valid_mask = self._align_point_temporal(valid_mask.to(device=pc_x0_pred.device).bool(), pc_x0_pred.shape[1])
-        else:
-            valid_mask = torch.ones(pc_x0_pred.shape[:3], device=pc_x0_pred.device, dtype=torch.bool)
-
-        condition_mask = point_info.get("pc_condition_mask")
-        if condition_mask is not None:
-            condition_mask = self._align_point_temporal(condition_mask.to(device=pc_x0_pred.device).bool(), pc_x0_pred.shape[1])
-            valid_mask = valid_mask & (~condition_mask)
-
-        valid = valid_mask[..., None].to(pc_loss.dtype)
-        denom = valid.sum().clamp(min=1.0) * pc_loss.shape[-1]
-        return (pc_loss * valid).sum() / denom
+        denoise_output_B_C_T_H_W = self.denoise(x_B_C_T_H_W_in_sigma_space, sigma_B_T, condition)
+        x0_pred_B_C_T_H_W = denoise_output_B_C_T_H_W.x0
+        eps_pred_B_C_T_H_W = denoise_output_B_C_T_H_W.eps
+        return eps_pred_B_C_T_H_W - x0_pred_B_C_T_H_W
 
     def denoise(
         self, xt_B_C_T_H_W: torch.Tensor, sigma: torch.Tensor, condition: Text2WorldCondition
@@ -428,7 +224,7 @@ class Video2WorldModel(Text2WorldModel):
             )
 
         # forward pass through the network
-        net_output = self.net(
+        net_output_B_C_T_H_W = self.net(
             x_B_C_T_H_W=net_state_in_B_C_T_H_W.to(
                 **self.tensor_kwargs
             ),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
@@ -439,13 +235,7 @@ class Video2WorldModel(Text2WorldModel):
                 },
             ),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
             **condition.to_dict(),
-        )
-        pc_net_output = None
-        if isinstance(net_output, tuple):
-            net_output_B_C_T_H_W, pc_net_output = net_output
-        else:
-            net_output_B_C_T_H_W = net_output
-        net_output_B_C_T_H_W = net_output_B_C_T_H_W.float()
+        ).float()
 
         x0_pred_B_C_T_H_W = c_skip_B_1_T_1_1 * xt_B_C_T_H_W + c_out_B_1_T_1_1 * net_output_B_C_T_H_W
         if condition.is_video and self.config.denoise_replace_gt_frames:
@@ -457,72 +247,7 @@ class Video2WorldModel(Text2WorldModel):
         # get noise prediction based on sde
         eps_pred_B_C_T_H_W = (xt_B_C_T_H_W - x0_pred_B_C_T_H_W) / sigma_B_1_T_1_1
 
-        pc_x0_pred = None
-        pc_eps_pred = None
-        pc_xt = getattr(condition, "pc_latent_xt", None)
-        if pc_net_output is not None and pc_xt is not None:
-            pc_net_output = pc_net_output.float()
-            pc_xt = pc_xt.to(device=pc_net_output.device, dtype=pc_net_output.dtype)
-            pc_xt_aligned = self._align_point_temporal(pc_xt, pc_net_output.shape[1])
-            sigma_pc_B_T = sigma_B_T.mean(dim=1, keepdim=True).expand(-1, pc_net_output.shape[1]).to(
-                device=pc_net_output.device, dtype=pc_net_output.dtype
-            )
-            c_skip_pc, c_out_pc, _, _ = self.scaling(sigma=rearrange(sigma_pc_B_T, "b t -> b t 1 1"))
-            pc_x0_pred = c_skip_pc * pc_xt_aligned + c_out_pc * pc_net_output
-            pc_eps_pred = (pc_xt_aligned - pc_x0_pred) / rearrange(sigma_pc_B_T, "b t -> b t 1 1")
-
-        return DenoisePrediction(
-            x0_pred_B_C_T_H_W,
-            eps_pred_B_C_T_H_W,
-            None,
-            pc_x0=pc_x0_pred,
-            pc_eps=pc_eps_pred,
-        )
-
-
-    def compute_loss_with_epsilon_and_sigma(
-        self,
-        x0_B_C_T_H_W: torch.Tensor,
-        condition: Text2WorldCondition,
-        epsilon_B_C_T_H_W: torch.Tensor,
-        sigma_B_T: torch.Tensor,
-    ):
-        mean_B_C_T_H_W, std_B_T = self.sde.marginal_prob(x0_B_C_T_H_W, sigma_B_T)
-        xt_B_C_T_H_W = mean_B_C_T_H_W + epsilon_B_C_T_H_W * rearrange(std_B_T, "b t -> b 1 t 1 1")
-
-        condition, point_info = self._prepare_point_diffusion_condition(condition, sigma_B_T, x0_B_C_T_H_W)
-        model_pred = self.denoise(xt_B_C_T_H_W, sigma_B_T, condition)
-
-        weights_per_sigma_B_T = self.get_per_sigma_loss_weights(sigma=sigma_B_T)
-        pred_mse_B_C_T_H_W = (x0_B_C_T_H_W - model_pred.x0) ** 2
-        edm_loss_B_C_T_H_W = pred_mse_B_C_T_H_W * rearrange(weights_per_sigma_B_T, "b t -> b 1 t 1 1")
-
-        kendall_loss = edm_loss_B_C_T_H_W
-        video_edm_loss = edm_loss_B_C_T_H_W.mean()
-        output_batch = {
-            "x0": x0_B_C_T_H_W,
-            "xt": xt_B_C_T_H_W,
-            "sigma": sigma_B_T,
-            "weights_per_sigma": weights_per_sigma_B_T,
-            "condition": condition,
-            "model_pred": model_pred,
-            "mse_loss": pred_mse_B_C_T_H_W.mean(),
-            "edm_loss": video_edm_loss,
-            "video_loss_unscaled": video_edm_loss,
-            "video_loss_scaled": video_edm_loss * float(self.loss_scale),
-            "edm_loss_per_frame": torch.mean(edm_loss_B_C_T_H_W, dim=[1, 3, 4]),
-        }
-
-        if point_info is not None and model_pred.pc_x0 is not None:
-            pc_loss = self._point_diffusion_loss(point_info, model_pred.pc_x0)
-            pc_weighted_loss = pc_loss * float(self.config.point_diffusion_loss_weight)
-            video_loss_scaled = output_batch["video_loss_scaled"].detach().clamp(min=1.0e-8)
-            output_batch["pc_diffusion_loss"] = pc_loss
-            output_batch["pc_loss_weighted"] = pc_weighted_loss
-            output_batch["pc_to_video_loss_ratio"] = pc_weighted_loss.detach() / video_loss_scaled
-            output_batch["aux_loss"] = pc_weighted_loss
-
-        return output_batch, kendall_loss, pred_mse_B_C_T_H_W, edm_loss_B_C_T_H_W
+        return DenoisePrediction(x0_pred_B_C_T_H_W, eps_pred_B_C_T_H_W, None)
 
     def get_x0_fn_from_batch(
         self,
@@ -583,15 +308,6 @@ class Video2WorldModel(Text2WorldModel):
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)
 
-        condition, point_state = self._prepare_point_sampling_condition(condition, x0)
-        uncondition = self._replace_condition_fields(
-            uncondition,
-            pc_latent_x0=None,
-            pc_latent_xt=None,
-            pc_latent_mask=None,
-            pc_condition_mask=None,
-        )
-
         if parallel_state.is_initialized():
             pass
         else:
@@ -600,26 +316,13 @@ class Video2WorldModel(Text2WorldModel):
             )
 
         def x0_fn(noise_x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-            nonlocal point_state
-            condition_for_step = (
-                self._condition_from_point_sampling_state(condition, point_state)
-                if point_state is not None else condition
-            )
-
             if self.config.use_flowunipc_scheduler:
-                cond_pred = self._denoise_prediction_from_flow_t(noise_x, sigma, condition_for_step)
-                uncond_pred = self._denoise_prediction_from_flow_t(noise_x, sigma, uncondition)
-                self._update_point_sampling_state(point_state, cond_pred.pc_x0)
-                cond_velocity = cond_pred.eps - cond_pred.x0
-                uncond_velocity = uncond_pred.eps - uncond_pred.x0
+                cond_velocity = self.denoise_with_velocity(noise_x, sigma, condition)
+                uncond_velocity = self.denoise_with_velocity(noise_x, sigma, uncondition)
                 velocity = uncond_velocity + guidance * (cond_velocity - uncond_velocity)
                 return velocity
-
-            cond_pred = self.denoise(noise_x, sigma, condition_for_step)
-            uncond_pred = self.denoise(noise_x, sigma, uncondition)
-            self._update_point_sampling_state(point_state, cond_pred.pc_x0)
-            cond_x0 = cond_pred.x0
-            uncond_x0 = uncond_pred.x0
+            cond_x0 = self.denoise(noise_x, sigma, condition).x0
+            uncond_x0 = self.denoise(noise_x, sigma, uncondition).x0
             raw_x0 = cond_x0 + guidance * (cond_x0 - uncond_x0)
             if "guided_image" in data_batch:
                 # replacement trick that enables inpainting with base model

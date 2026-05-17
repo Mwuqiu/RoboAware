@@ -1,7 +1,0 @@
-{
-    "inference_type": "image2world",
-    "name": "libero_pick_exp",
-    "prompt_path": "libero_pick_exp.txt",
-    "input_path": "libero_pick_exp.mp4",
-    "resolution": "512,512"
-}

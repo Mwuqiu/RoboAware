@@ -1,1 +1,0 @@
-A SO-100 robotic arm pushes an open drawer. The drawer slides in but remains slightly ajar with a visible gap. The robotic arm then disengages and retracts to its starting position.

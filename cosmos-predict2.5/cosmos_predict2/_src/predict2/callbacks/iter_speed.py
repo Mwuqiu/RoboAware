@@ -53,18 +53,11 @@ class IterSpeed(EveryN):
         loss: torch.Tensor,
         iteration: int = 0,
     ) -> None:
-        loss_parts = []
-        for key in ["video_loss_scaled", "pc_diffusion_loss", "pc_loss_weighted", "pc_to_video_loss_ratio"]:
-            value = output_batch.get(key)
-            if value is not None:
-                loss_parts.append(f"{key}: {value.detach().float().item():.4g}")
-        loss_detail = " | " + " | ".join(loss_parts) if loss_parts else ""
-
         if self.hit_counter < self.hit_thres:
             log.info(
                 f"Iteration {iteration}: "
                 f"Hit counter: {self.hit_counter + 1}/{self.hit_thres} | "
-                f"Loss: {loss.item():.4f}{loss_detail} | "
+                f"Loss: {loss.item():.4f} | "
                 f"Time: {time.time() - self.last_hit_time:.2f}s"
             )
             self.hit_counter += 1
@@ -90,13 +83,7 @@ class IterSpeed(EveryN):
         cur_time = time.time()
         iter_speed = (cur_time - self.time) / self.every_n / self.step_size
 
-        loss_parts = []
-        for key in ["video_loss_scaled", "pc_diffusion_loss", "pc_loss_weighted", "pc_to_video_loss_ratio"]:
-            value = output_batch.get(key)
-            if value is not None:
-                loss_parts.append(f"{key}: {value.detach().float().item():.4g}")
-        loss_detail = " | " + " | ".join(loss_parts) if loss_parts else ""
-        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}{loss_detail}")
+        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
 
         if wandb.run:
             sample_counter = getattr(trainer, "sample_counter", iteration)

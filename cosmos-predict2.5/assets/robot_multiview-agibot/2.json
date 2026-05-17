@@ -1,5 +1,3 @@
-{
-    "name": "2",
-    "input_name": "2",
-    "prompt": "The robot arm picks up a transparent plastic bag containing a bottle from the 2-grid material frame on the left side of the table. It then moves the bag to the right and places it into the blue target frame. Next, it picks up another object from the material frame, which appears to be a small cylindrical item wrapped in pink packaging, and positions it near the first object in the target frame."
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:a88a5de193b0f436037746dd58b4181c2bdb98268e7948f8aa60559d82c3bc21
+size 458

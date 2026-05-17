@@ -250,20 +250,6 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                 "conditioner should not have learnable parameters"
             )
             self.net = self.build_net()
-            # ── PointAdapter 冻结策略 ──────────────────────────────────────────
-            self.net.requires_grad_(False)
-            for name, param in self.net.named_parameters():
-                if "point_adapter" in name:
-                    param.requires_grad = True
-            self.net.point_adapter.to(torch.bfloat16)
-            trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
-            total     = sum(p.numel() for p in self.net.parameters())
-            log.info(
-                f"[PointAdapter] Trainable params: {trainable/1e6:.1f}M / "
-                f"{total/1e6:.1f}M ({100*trainable/total:.2f}%)"
-            )
-            # ──────────────────────────────────────────────────────────────────
-
             self._param_count = count_params(self.net, verbose=False)
 
             if config.ema.enabled:
@@ -745,38 +731,6 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         return self.forward(data)
 
     def forward(self, data_batch: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-
-        # # ---- DEBUG: check pointcloud loaded/aligned ----
-        # if ("pc_latent_x0" in data_batch) and ("video" in data_batch):
-        #     v = data_batch["video"]
-        #     pc = data_batch["pc_latent_x0"]
-        #     m = data_batch.get("pc_latent_mask", None)
-
-        #     print(
-        #         "[PC_DEBUG]",
-        #         "video:", tuple(v.shape), v.dtype, v.device,
-        #         "pc_x0:", tuple(pc.shape), pc.dtype, pc.device,
-        #         "pc_mask:", (tuple(m.shape), m.dtype, m.device) if m is not None else None,
-        #         "start_frame:", data_batch.get("start_frame", None),
-        #     )
-
-        #     if v.ndim == 5:  # [B,C,T,H,W]
-        #         assert pc.ndim == 4, pc.shape
-        #         assert pc.shape[1] == v.shape[2], f"T mismatch: pc_T={pc.shape[1]} vs video_T={v.shape[2]}"
-        #         if m is not None:
-        #             assert m.shape[:2] == pc.shape[:2], f"mask mismatch: {m.shape} vs {pc.shape}"
-        #     elif v.ndim == 4:  # [C,T,H,W]
-        #         assert pc.ndim == 3, pc.shape
-        #         assert pc.shape[0] == v.shape[1], f"T mismatch: pc_T={pc.shape[0]} vs video_T={v.shape[1]}"
-        #         if m is not None:
-        #             assert m.shape[0] == pc.shape[0], f"mask mismatch: {m.shape} vs {pc.shape}"
-        #     else:
-        #         raise ValueError(f"unexpected video shape: {v.shape}")
-
-        # else:
-        #     print("[PC_DEBUG] missing keys:", [k for k in ["video","pc_latent_x0","pc_latent_mask"] if k not in data_batch])
-        # # ---- END DEBUG ----
-        
         # Obtain text embeddings online
         if self.config.text_encoder_config is not None and self.config.text_encoder_config.compute_online:
             text_embeddings = self.text_encoder.compute_text_embeddings_online(data_batch, self.input_caption_key)
@@ -845,9 +799,9 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             "model_pred": vt_pred_B_C_T_H_W,
             "edm_loss": loss,
             # For per-sample loss logging
-            # "timesteps": timesteps,
-            # "per_instance_loss": per_instance_loss,
-            # "n_cond_frames": condition.num_conditional_frames_B,
+            "timesteps": timesteps,
+            "per_instance_loss": per_instance_loss,
+            "n_cond_frames": condition.num_conditional_frames_B,
         }
 
         return output_batch, loss

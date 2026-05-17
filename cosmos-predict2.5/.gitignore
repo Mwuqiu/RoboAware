@@ -201,10 +201,14 @@ cython_debug/
 /outputs/
 /results/
 /tmp/
-/wandb/
-*.zip
-train_output.log
 
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.mp4
+
+# Custom additions (Mwuqiu RoboAware fork — keep these out of git)
+*.zip
+wandb/
+exp/
+.venv/
+datasets/

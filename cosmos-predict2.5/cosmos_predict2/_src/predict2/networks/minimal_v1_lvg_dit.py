@@ -16,7 +16,7 @@
 from typing import List, Optional, Tuple
 
 import torch
-import inspect
+
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import MiniTrainDIT
 
@@ -41,7 +41,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         img_context_emb: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
-        # del kwargs
+        del kwargs
 
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
@@ -50,15 +50,6 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, torch.zeros((B, 1, T, H, W), dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)], dim=1
             )
-            
-        super_fwd = super().forward
-        sig = inspect.signature(super_fwd)
-
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if not has_var_kw:
-            allowed = set(sig.parameters.keys())
-            kwargs = {k: v for k, v in kwargs.items() if k in allowed}
-
         return super().forward(
             x_B_C_T_H_W=x_B_C_T_H_W,
             timesteps_B_T=timesteps_B_T * self.timestep_scale,
@@ -68,5 +59,4 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             data_type=data_type,
             intermediate_feature_ids=intermediate_feature_ids,
             img_context_emb=img_context_emb,
-            **kwargs,
         )

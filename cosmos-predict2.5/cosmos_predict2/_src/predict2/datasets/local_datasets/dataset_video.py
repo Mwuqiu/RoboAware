@@ -18,8 +18,6 @@
 import json
 import os
 import random
-import sys
-import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -36,83 +34,6 @@ from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_utils import ResizePreprocess, ToTensorVideo
 
 
-class PointcloudEncodingConfigurationError(RuntimeError):
-    """Raised for non-retryable online pointcloud encoding setup issues."""
-
-
-_POINTCEPT_ENCODERS: dict[str, torch.nn.Module] = {}
-_POINTCEPT_ENCODER_LOCK = threading.Lock()
-
-
-def _make_absolute_pointcept_path(pointcept_root: Path, path_str: str) -> str:
-    path = Path(path_str)
-    if path.is_absolute():
-        return str(path)
-    return str((pointcept_root / path).resolve())
-
-
-def _find_pointcept_root() -> Optional[Path]:
-    candidates: list[Path] = []
-
-    pointcept_root = os.environ.get("POINTCEPT_ROOT")
-    if pointcept_root:
-        candidates.append(Path(pointcept_root).expanduser())
-
-    for parent in Path(__file__).resolve().parents:
-        candidates.append(parent / "Pointcept")
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        candidate_key = str(candidate)
-        if candidate_key in seen:
-            continue
-        seen.add(candidate_key)
-        if (candidate / "pointflow" / "pf_encoder.py").is_file():
-            return candidate
-    return None
-
-
-# ── Pointcept pf_encoder import ──────────────────────────────────────────────
-# pf_encoder.py internally does sys.path.insert(0, ...) to add the Pointcept
-# root, so the only thing cosmos needs is to make the pointflow directory
-# importable.
-_pointcept_root = _find_pointcept_root()
-if _pointcept_root is None:
-    raise PointcloudEncodingConfigurationError(
-        "Could not locate the Pointcept repository. Set POINTCEPT_ROOT to your Pointcept checkout."
-    )
-_pointflow_dir = str(_pointcept_root / "pointflow")
-if _pointflow_dir not in sys.path:
-    sys.path.insert(0, _pointflow_dir)
-import pf_encoder  # noqa: E402
-
-
-def _get_online_pointcloud_encoder(pc_encoder_config: Optional[dict] = None) -> torch.nn.Module:
-    if not torch.cuda.is_available():
-        raise PointcloudEncodingConfigurationError(
-            "Online pointcloud encoding requires CUDA because Pointcept loads its checkpoint onto GPU."
-        )
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    device_key = str(device)
-
-    with _POINTCEPT_ENCODER_LOCK:
-        encoder = _POINTCEPT_ENCODERS.get(device_key)
-        if encoder is None:
-            pf_encoder.apply_encoder_config(pc_encoder_config or {})
-            pf_encoder.CONFIG_FILE = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.CONFIG_FILE)
-            pf_encoder.EXP_DIR = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.EXP_DIR)
-            pf_encoder.WEIGHT_PATH = _make_absolute_pointcept_path(_pointcept_root, pf_encoder.WEIGHT_PATH)
-            encoder = pf_encoder.PTV3Encoder(pf_encoder.load_ptv3_model()).to(device)
-            encoder.eval()
-            for parameter in encoder.parameters():
-                parameter.requires_grad_(False)
-            _POINTCEPT_ENCODERS[device_key] = encoder
-
-    return encoder
-
-
 class VideoDataset(Dataset):
     def __init__(
         self,
@@ -122,13 +43,6 @@ class VideoDataset(Dataset):
         prompt_type: str | None = None,  # "long", "short", "medium", or None for auto
         caption_format: str = "auto",  # "text", "json", or "auto"
         video_paths: Optional[list[str]] = None,
-        pc_latent_source: str = "auto",  # "precomputed", "online", or "auto"
-        pc_latent_k: int = 30,
-        pc_latent_sample: str = "first",
-        pc_latent_pad_value: float = 0.0,
-        pc_latent_amp: bool = False,
-        pc_latent_grid_size: float = 0.005,
-        pc_encoder_config: Optional[dict] = None,
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -151,26 +65,12 @@ class VideoDataset(Dataset):
         self.sequence_length = num_frames
         self.prompt_type = prompt_type
         self.caption_format = caption_format
-        self.pc_latent_source = pc_latent_source
-        self.pc_latent_k = int(pc_latent_k)
-        self.pc_latent_sample = pc_latent_sample
-        self.pc_latent_pad_value = float(pc_latent_pad_value)
-        self.pc_latent_amp = bool(pc_latent_amp)
-        self.pc_latent_grid_size = float(pc_latent_grid_size)
-        self.pc_encoder_config = pc_encoder_config
-
-        if self.pc_latent_source not in {"precomputed", "online", "auto"}:
-            raise ValueError(
-                f"Invalid pc_latent_source: {self.pc_latent_source}. Must be 'precomputed', 'online', or 'auto'"
-            )
 
         # Determine caption format and directory
         self._setup_caption_format()
 
-        self.pc_latent_dir = os.path.join(self.dataset_dir, "pc_latent")
-        self.pointcloud_dir = os.path.join(self.dataset_dir, "pointclouds")
         video_dir = os.path.join(self.dataset_dir, "videos")
-        
+
         if video_paths is None:
             self.video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(".mp4")]
             self.video_paths = sorted(self.video_paths)
@@ -178,107 +78,8 @@ class VideoDataset(Dataset):
             self.video_paths = video_paths
         log.info(f"{len(self.video_paths)} videos in total")
 
-        self._all_precomputed_pc_latents_available = self._check_all_precomputed_pc_latents_available()
-        if self.pc_latent_source == "precomputed" and not self._all_precomputed_pc_latents_available:
-            raise ValueError(
-                f"pc_latent_source='precomputed' but not every video has a matching latent in {self.pc_latent_dir}"
-            )
-        if self.pc_latent_source == "online" and not os.path.isdir(self.pointcloud_dir):
-            raise ValueError(
-                f"pc_latent_source='online' but pointclouds directory is missing: {self.pointcloud_dir}"
-            )
-
-        self.requires_main_process_data_loading = self.pc_latent_source == "online" or (
-            self.pc_latent_source == "auto"
-            and os.path.isdir(self.pointcloud_dir)
-            and not self._all_precomputed_pc_latents_available
-        )
-
         self.num_failed_loads = 0
         self.preprocess = T.Compose([ToTensorVideo(), ResizePreprocess((video_size[0], video_size[1]))])
-
-        if self.requires_main_process_data_loading:
-            log.info(
-                "VideoDataset will compute pc_latent online from pointclouds; DataLoader workers should stay at 0."
-            )
-
-    def _check_all_precomputed_pc_latents_available(self) -> bool:
-        if not os.path.isdir(self.pc_latent_dir):
-            return False
-
-        available_stems = {path.stem for path in Path(self.pc_latent_dir).glob("*.pt")}
-        return all(Path(video_path).stem in available_stems for video_path in self.video_paths)
-
-    def _slice_precomputed_pc_latent(
-        self, pc_x0: torch.Tensor, pc_mask: torch.Tensor, start_frame: int, video_basename: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        end_frame = start_frame + self.sequence_length
-        pc_x0 = pc_x0[start_frame:end_frame]
-        pc_mask = pc_mask[start_frame:end_frame]
-        if pc_x0.shape[0] != self.sequence_length or pc_mask.shape[0] != self.sequence_length:
-            raise PointcloudEncodingConfigurationError(
-                f"Precomputed pc_latent for {video_basename} does not cover frames [{start_frame}, {end_frame})"
-            )
-        return pc_x0, pc_mask.bool()
-
-    def _load_precomputed_pc_latent(
-        self, video_basename: str, start_frame: int
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        pc_path = os.path.join(self.pc_latent_dir, f"{video_basename}.pt")
-        if not os.path.exists(pc_path):
-            return None
-
-        pc = torch.load(pc_path, map_location="cpu")
-        return self._slice_precomputed_pc_latent(pc["x0"], pc["mask"], start_frame, video_basename)
-
-    def _encode_pointcloud_window(self, video_basename: str, start_frame: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        pc_path = os.path.join(self.pointcloud_dir, f"{video_basename}.npy")
-        if not os.path.exists(pc_path):
-            if self.pc_latent_source == "auto":
-                return None
-            raise PointcloudEncodingConfigurationError(f"Pointcloud episode not found: {pc_path}")
-
-        episode = np.load(pc_path, allow_pickle=True).item()
-        coords = episode.get("coord")
-        if coords is None:
-            raise PointcloudEncodingConfigurationError(f"Pointcloud episode is missing 'coord': {pc_path}")
-
-        end_frame = start_frame + self.sequence_length
-        if len(coords) < end_frame:
-            raise PointcloudEncodingConfigurationError(
-                f"Pointcloud episode {pc_path} has {len(coords)} frames but needs at least {end_frame}"
-            )
-
-        encoder_input = {
-            "coord": list(coords[start_frame:end_frame]),
-            "grid_size": float(episode.get("grid_size") or self.pc_latent_grid_size),
-        }
-
-        encoder = _get_online_pointcloud_encoder(self.pc_encoder_config)
-        feats, mask = encoder.encode_batch(
-            [encoder_input],
-            k=self.pc_latent_k,
-            sample=self.pc_latent_sample,
-            pad_value=self.pc_latent_pad_value,
-            return_mask=True,
-            amp=self.pc_latent_amp,
-        )
-        return feats[0].detach().cpu(), mask[0].detach().cpu().bool()
-
-    def _load_pc_latent_window(self, video_basename: str, start_frame: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        if self.pc_latent_source != "online":
-            precomputed = self._load_precomputed_pc_latent(video_basename, start_frame)
-            if precomputed is not None:
-                return precomputed
-            if self.pc_latent_source == "precomputed":
-                raise PointcloudEncodingConfigurationError(
-                    f"Missing precomputed pc_latent for {video_basename} in {self.pc_latent_dir}"
-                )
-
-        if self.pc_latent_source == "precomputed":
-            return None
-
-        return self._encode_pointcloud_window(video_basename, start_frame)
 
     def __str__(self) -> str:
         return f"{len(self.video_paths)} samples from {self.dataset_dir}"
@@ -301,8 +102,7 @@ class VideoDataset(Dataset):
         end_frame = start_frame + self.sequence_length
         frame_ids = np.arange(start_frame, end_frame).tolist()
 
-        _batch = vr.get_batch(frame_ids)
-        frame_data = _batch.numpy() if hasattr(_batch, "numpy") else _batch.asnumpy()
+        frame_data = vr.get_batch(frame_ids).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache
 
         try:
@@ -310,7 +110,7 @@ class VideoDataset(Dataset):
         except Exception:  # failed to read FPS, assume it is 16
             fps = 16
         del vr  # delete the reader to avoid memory leak
-        return frame_data, fps, start_frame
+        return frame_data, fps
 
     def _setup_caption_format(self) -> None:
         """Determine the caption format and set up the caption directory."""
@@ -383,33 +183,22 @@ class VideoDataset(Dataset):
             return ""
 
     def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
-        frames, fps, start_frame = self._load_video(video_path)
+        frames, fps = self._load_video(video_path)
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
-        return frames, fps, start_frame
+        return frames, fps
 
     def __getitem__(self, index: int) -> dict | Any:
         try:
             data = dict()
-            video_path = self.video_paths[index]
-            video, fps, start_frame = self._get_frames(video_path)
+            video, fps = self._get_frames(self.video_paths[index])
             video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
 
             # Load caption based on format
+            video_path = self.video_paths[index]
             video_basename = os.path.basename(video_path).replace(".mp4", "")
-
-            pc_latent = self._load_pc_latent_window(video_basename, start_frame)
-            if pc_latent is not None:
-                pc_x0, pc_mask = pc_latent
-                data["pc_latent_x0"] = pc_x0
-                data["pc_latent_mask"] = pc_mask
-
-            data["start_frame"] = start_frame
-            data["episode_id"] = video_basename
-            data["video_basename"] = video_basename
-            data["video_path"] = video_path
 
             if self.caption_format == "json":
                 caption_path = os.path.join(self.caption_dir, f"{video_basename}.json")
@@ -429,8 +218,6 @@ class VideoDataset(Dataset):
             data["padding_mask"] = torch.zeros(1, h, w)
 
             return data
-        except PointcloudEncodingConfigurationError:
-            raise
         except Exception as e:
             self.num_failed_loads += 1
             log.warning(
@@ -471,14 +258,6 @@ def get_generic_dataloader(
     Returns:
         Configured DataLoader
     """
-    if getattr(dataset, "requires_main_process_data_loading", False) and num_workers != 0:
-        log.warning(
-            f"Overriding DataLoader num_workers from {num_workers} to 0 because VideoDataset is doing online pointcloud encoding."
-        )
-        num_workers = 0
-        prefetch_factor = None
-        persistent_workers = False
-
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
