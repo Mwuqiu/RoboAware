@@ -137,12 +137,12 @@ class PointAdapter(nn.Module):
         # ── PCEncoder: D_pc → d_main, xavier init ──────────────────────────
         self.pc_encoder = PCEncoder(d_pc=d_pc, d_a=d_a)
 
-        # ── (V4 NEW) Learnable null PC tokens. Shape (1, 1, K, d_main).
+        # ── (V4 NEW) Learnable null PC tokens. Shape (1, K, d_main).
         # 当 pc_mask 中某个 (frame, token) 是 False (padding 或 zero-coord 的 fallback voxel),
         # apply_stage 用 null_pc_tokens 在该位置替换 PC encoder 输出, 让 cross-attn 永远
-        # 看到 "real-or-null" 的有内容 token. (1, 1, ...) shape 方便 expand 到 (B*T, K, D).
+        # 看到 "real-or-null" 的有内容 token. (1, K, D) shape 直接 expand 到 (B*T, K, D).
         self.null_pc_tokens = nn.Parameter(
-            torch.empty(1, 1, self.pc_latent_k, d_main)
+            torch.empty(1, self.pc_latent_k, d_main)
         )
 
         # ── Adapter Blocks: 每个 inject 点一个 Cosmos Block, 与 backbone 同构 ──
