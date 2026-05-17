@@ -5,6 +5,7 @@ from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
+from cosmos_predict2._src.predict2.callbacks.point_adapter_monitor import PointAdapterMonitor
 from cosmos_predict2._src.predict2.callbacks.validation_draw_sample import ValidationDrawSample
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_video import (
     VideoDataset,
@@ -134,6 +135,9 @@ trainer_conf = dict(
             save_s3=False,
             do_x0_prediction=True,
         ),
+        # V4: monitor PointAdapter weight/grad health (null_pc_tokens, pc_encoder, adaLN gate)
+        # Fires every 50 iters (~11 min at 13.5 s/iter). Cheap: pure weight reads + all_reduces.
+        point_adapter_monitor=L(PointAdapterMonitor)(every_n=50, save_s3=False),
     ),
 )
 
