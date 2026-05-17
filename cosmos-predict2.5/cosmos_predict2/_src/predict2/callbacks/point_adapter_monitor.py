@@ -39,6 +39,18 @@ from cosmos_predict2._src.imaginaire.trainer import ImaginaireTrainer
 from cosmos_predict2._src.imaginaire.utils import distributed, log
 
 
+def _to_local(t: torch.Tensor) -> torch.Tensor:
+    """Get the local shard of a (possibly DTensor / FSDP-sharded) tensor as a plain tensor.
+
+    Necessary because under fully_shard FSDP each param is a DTensor; dispatching
+    ops on it goes through DTensor.__torch_dispatch__, which then can't handle
+    `dist.all_reduce` (no DeviceMesh). Converting to local first avoids that path.
+    """
+    if hasattr(t, "to_local"):
+        return t.to_local()
+    return t
+
+
 def _full_sq_sum(param: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """Squared sum of a (possibly FSDP-sharded) param, all-reduced to global value.
 
@@ -47,7 +59,8 @@ def _full_sq_sum(param: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
     if param is None:
         return None
-    local_sq = param.detach().float().pow(2).sum()
+    local = _to_local(param.detach()).float()
+    local_sq = local.pow(2).sum()
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
     return local_sq
@@ -64,7 +77,7 @@ def _full_std(param: Optional[torch.Tensor]) -> float:
     """Population std of a (possibly FSDP-sharded) param via all-reduce."""
     if param is None:
         return 0.0
-    p = param.detach().float()
+    p = _to_local(param.detach()).float()
     local_sum = p.sum()
     local_sq = p.pow(2).sum()
     local_n = torch.tensor(float(p.numel()), device=p.device)
@@ -83,7 +96,7 @@ def _full_std(param: Optional[torch.Tensor]) -> float:
 def _full_abs_mean(param: Optional[torch.Tensor]) -> float:
     if param is None:
         return 0.0
-    p = param.detach().float()
+    p = _to_local(param.detach()).float()
     local_sum = p.abs().sum()
     local_n = torch.tensor(float(p.numel()), device=p.device)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
