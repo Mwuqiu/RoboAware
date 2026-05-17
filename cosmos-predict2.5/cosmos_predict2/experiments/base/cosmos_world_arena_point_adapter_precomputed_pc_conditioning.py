@@ -105,7 +105,11 @@ optimizer_conf = dict(
 scheduler_conf = dict(
     f_max=[0.5],
     f_min=[0.2],
-    warm_up_steps=[2_000],
+    # V4: shortened warmup from 2000 → 500. Backbone is already pre-trained;
+    # only the small PointAdapter (incl. null_pc_tokens) trains from scratch.
+    # 500 steps is enough for AdamW second-moment stability without burning
+    # ~5h of training budget on (near-)zero effective LR.
+    warm_up_steps=[500],
     cycle_lengths=[100000],
 )
 
