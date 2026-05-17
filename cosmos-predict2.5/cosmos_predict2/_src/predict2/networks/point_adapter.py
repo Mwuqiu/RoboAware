@@ -1,36 +1,37 @@
-"""PointAdapter A.v3
+"""PointAdapter A.v4
 
-设计要点（与原版的差异）
-────────────────────────
+V4 (差异 vs V3):
+─────────────────
+* 新增 learnable null PC tokens (per K-position). 在 cross-attn 之前, 用 pc_mask
+  做 per-token 替换: True (valid voxel) 保留 PC encoder 输出; False (padding) 用
+  learnable null token 替代. 这样 cross-attn 看到的 30 个 token 永远都有内容,
+  模型可以学习 "real 还是 null" 的结构化 attention, 不再被迫退化为 uniform pool.
+* 删除 V3 末尾的 frame-level mask (delta * frame_visible) — 那段在实际中是 dead
+  code (每 frame 至少 1 valid voxel, frame_visible 永远 True), 而且引入了诱导
+  uniform attention 的训练约束.
+* none mode (PC 全 0) 下, 所有 token 都被 null replace, adapter 仍可贡献一个
+  default residual, 不再 freeze.
+
+设计要点 (沿用 V3)
+────────────────
 1. PC 通过 Cosmos Block 的 cross-attn (K/V) 注入主干, 不再 mean-pool + spatial broadcast.
-   每个 video patch (h, w) 在 K=30 个 PC token 中自己挑 attention 权重.
-2. Adapter Block 与 backbone Cosmos Block 同构 (同一个 block_factory). x_dim=d_main,
-   context_dim=d_main (PC 已投到 d_main); init/adaLN-zero 复用 backbone 已验证的 scheme.
-3. Block 在 (B*T) 维度上 per-frame 工作: 输入 [B*T, 1, H, W, D], cross-attn K/V
-   是该 latent t 的 PC token [B*T, K, D]. 满足"PC 与 video 逐帧对齐, 不跨时间 attend".
-4. 不再使用 d_a 中间瓶颈 / x_proj / t_proj / before_proj / after_projs.
-   唯一的 zero-init 由 Block 自带的 adaLN-zero 提供, 不会堵 PC → adapter 的梯度通路.
-5. Frame-level mask: prefix mode 后段 / none mode 等 PC 不可见的 frame, 输出强制为 0,
-   完全交给 backbone 通过 temporal layers 自己 propagate.
+2. Adapter Block 与 backbone Cosmos Block 同构. x_dim=d_main, context_dim=d_main;
+   init/adaLN-zero 复用 backbone 已验证的 scheme.
+3. Block 在 (B*T) 维度上 per-frame 工作: cross-attn K/V 是该 latent t 的 PC token.
+4. 不用 d_a 中间瓶颈 / x_proj / before_proj / after_projs.
+5. PC 在 stage 间 passthrough, 不更新.
 
-外部契约
-────────
-PointAdapter 暴露给 backbone (minimal_v4_dit.py) 的接口完全保持不变:
-  - .pc_encoder(pc_latent)            backbone 在 forward 入口直接 call
-  - ._align_temporal(pc_feat, T)      backbone 在 forward 入口直接 call
-  - .inject_block_ids                 list[int]
-  - .apply_stage(adapter_idx=, pc_feat_BT_K_da=, pc_mask_BT_K=,
-                 x_main=, t_embedding_B_T_D=, crossattn_emb=)
-                                       返回 (pc_feat_next, residual);
-                                       residual shape == x_main.shape, 直接 add.
-所以 minimal_v4_dit.py 不需要任何改动.
+外部契约 (vs V3)
+────────────────
+PointAdapter.__init__ 多了 `pc_latent_k=30` 参数 (用来 pre-allocate null tokens).
+其他接口完全不变 — minimal_v4_dit.py 不需要再加 K 参数 (默认 30 即可, 跟数据集对齐).
 
 注意
 ────
-- d_a 必须等于 d_main. exp 配置里 point_adapter_d_a=None (= d_main) 已经满足.
+- d_a 必须等于 d_main.
 - adapter_block_depth 必须为 1.
-- 旧 checkpoint 的 PointAdapter 子模块 shape 与新版完全不同, 不能 resume,
-  需要从 backbone+text 已有的 base checkpoint 起重新训.
+- V3 ckpt 缺少 null_pc_tokens 参数, V4 不能直接 resume V3 ckpt. 需要从 backbone
+  base checkpoint 重训 (null tokens 从 trunc_normal_(std=0.02) 起步).
 """
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -69,7 +70,7 @@ class PCEncoder(nn.Module):
 
 
 class PointAdapter(nn.Module):
-    """A.v3: 同构 Cosmos Block + cross-attn (video Q ↔ PC K/V) 注入."""
+    """A.v4: 同构 Cosmos Block + cross-attn + learnable null PC tokens for padded positions."""
 
     def __init__(
         self,
@@ -86,6 +87,7 @@ class PointAdapter(nn.Module):
         dropout: float = 0.0,
         block_factory: Optional[Callable[..., nn.Module]] = None,
         block_factory_kwargs: Optional[Dict[str, Any]] = None,
+        pc_latent_k: int = 30,    # NEW (V4): K (PC token count per frame); used to pre-allocate null tokens.
     ):
         super().__init__()
         del num_heads, mlp_ratio, dropout  # 通过 block_factory_kwargs 传给 Cosmos Block
@@ -106,6 +108,7 @@ class PointAdapter(nn.Module):
         self.d_a = d_a
         self.d_main = d_main
         self.adapter_block_depth = 1
+        self.pc_latent_k = int(pc_latent_k)
 
         # ── 注入点解析 (与原版一致) ─────────────────────────────────────────
         if inject_block_ids is not None:
@@ -134,6 +137,14 @@ class PointAdapter(nn.Module):
         # ── PCEncoder: D_pc → d_main, xavier init ──────────────────────────
         self.pc_encoder = PCEncoder(d_pc=d_pc, d_a=d_a)
 
+        # ── (V4 NEW) Learnable null PC tokens. Shape (1, 1, K, d_main).
+        # 当 pc_mask 中某个 (frame, token) 是 False (padding 或 zero-coord 的 fallback voxel),
+        # apply_stage 用 null_pc_tokens 在该位置替换 PC encoder 输出, 让 cross-attn 永远
+        # 看到 "real-or-null" 的有内容 token. (1, 1, ...) shape 方便 expand 到 (B*T, K, D).
+        self.null_pc_tokens = nn.Parameter(
+            torch.empty(1, 1, self.pc_latent_k, d_main)
+        )
+
         # ── Adapter Blocks: 每个 inject 点一个 Cosmos Block, 与 backbone 同构 ──
         # 关键: x_dim=d_main (输入 video tokens), context_dim=d_main (PC 已投到 d_main).
         block_factory_kwargs = dict(block_factory_kwargs or {})
@@ -158,6 +169,10 @@ class PointAdapter(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        # (V4 NEW) null PC tokens: small random init so gradients can flow.
+        # Zero-init would block learning entirely (delta would be deterministic).
+        nn.init.trunc_normal_(self.null_pc_tokens, std=0.02)
 
         # Each adapter Block uses the backbone Cosmos Block's own init_weights
         # (includes adaLN-zero for the modulation last layer, trunc_normal for
@@ -197,15 +212,15 @@ class PointAdapter(nn.Module):
         self,
         adapter_idx: int,
         pc_feat_BT_K_da: torch.Tensor,         # [B*T, K, d_main], 来自 PCEncoder + _align_temporal
-        pc_mask_BT_K: Optional[torch.Tensor],  # [B*T, K] bool, True=有效
+        pc_mask_BT_K: Optional[torch.Tensor],  # [B*T, K] bool, True=有效 voxel, False=padded/null slot
         x_main: torch.Tensor,                  # [B, T, H, W, d_main], backbone block 输出
         t_embedding_B_T_D: Optional[torch.Tensor] = None,
         crossattn_emb: Optional[torch.Tensor] = None,  # 传 backbone 的 text emb, 本设计不用
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """A.v3 注入: video tokens 作为 query, PC tokens 作为 cross-attn K/V.
+        """A.v4 注入: video tokens 作为 query, PC tokens (real OR null) 作为 cross-attn K/V.
 
         Returns:
-            pc_feat_next: [B*T, K, d_main]  (本版本不更新 PC, passthrough; 保留接口)
+            pc_feat_next: [B*T, K, d_main]  (passthrough; PC 不在 stage 间更新)
             residual:     [B, T, H, W, d_main]  直接 add 到 backbone block output
         """
         del crossattn_emb  # adapter 不用 text; PC 自带空间结构
@@ -214,6 +229,19 @@ class PointAdapter(nn.Module):
             raise ValueError("Cosmos Block adapter requires t_embedding_B_T_D")
 
         B, T, H, W, D = x_main.shape
+        BT, K, _ = pc_feat_BT_K_da.shape
+
+        # ── (V4 NEW) per-token null replacement ─────────────────────────────
+        # 把 padding 位置 (mask=False) 替换为 learnable null_pc_tokens. 这样 cross-attn
+        # 看到的 K=30 个 token 永远有内容, 模型可以学 "real vs null" 的结构化 attention,
+        # 避免被迫退化为 uniform pool (V3 的失败模式).
+        if pc_mask_BT_K is not None:
+            null_BT_K_D = self.null_pc_tokens.to(pc_feat_BT_K_da.dtype).expand(BT, K, D)
+            pc_feat_BT_K_da = torch.where(
+                pc_mask_BT_K.unsqueeze(-1),    # [B*T, K, 1] broadcast over D
+                pc_feat_BT_K_da,                # real voxel encoding
+                null_BT_K_D,                    # learnable null prior
+            )
 
         # ── reshape video 到 per-frame batch ──
         # Block 看到的 input shape 是 (B*T, 1, H, W, D), 内部 self-attn over (1*H*W) per frame
@@ -232,7 +260,7 @@ class PointAdapter(nn.Module):
                 )
         emb_BT_1_D = rearrange(t_emb, "b t d -> (b t) 1 d")
 
-        # ── 调用同构 Cosmos Block, cross-attn K/V = 当前 latent t 的 PC token ──
+        # ── 调用同构 Cosmos Block, cross-attn K/V = 当前 latent t 的 (real + null) PC token ──
         block = self.adapter_blocks[adapter_idx]
         out_BT_1_H_W_D = block(
             x_BT_1_H_W_D,
@@ -247,15 +275,11 @@ class PointAdapter(nn.Module):
         delta_BT_1_H_W_D = out_BT_1_H_W_D - x_BT_1_H_W_D
         delta_B_T_H_W_D = rearrange(delta_BT_1_H_W_D, "(b t) 1 h w d -> b t h w d", b=B, t=T)
 
-        # ── frame-level mask: PC 不可见的帧强制 0 (prefix 后段 / none mode) ──
-        # cross-attn 内部 K/V padding 全 False 时 softmax 可能数值不稳, 这里用乘法显式截断.
-        if pc_mask_BT_K is not None:
-            frame_visible_BT = pc_mask_BT_K.any(dim=-1).to(delta_B_T_H_W_D.dtype)  # [B*T]
-            frame_visible_B_T = rearrange(frame_visible_BT, "(b t) -> b t", b=B, t=T)
-            delta_B_T_H_W_D = delta_B_T_H_W_D * frame_visible_B_T[:, :, None, None, None]
+        # (V4) 去掉 V3 末尾的 frame-level mask multiply — 在 V3 中是 dead code
+        # (每 frame 至少 1 valid voxel, frame_visible 永远 True), 而且诱导了 uniform attention
+        # 的训练约束 (模型必须对 0 内容和真 PC 输出"等价的小 delta"). null token 接管这个职责.
 
         # PC tokens 在各 stage 之间不更新, 直接 passthrough.
-        # (与原版"PC 通过 adapter chain 串行更新"不同; PC 视作固定 prior.)
         return pc_feat_BT_K_da, delta_B_T_H_W_D
 
     # forward 接口保留, 但 backbone 实际只 call apply_stage. 留作 standalone debugging.
