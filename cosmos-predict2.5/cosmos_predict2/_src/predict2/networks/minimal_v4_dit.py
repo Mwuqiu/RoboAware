@@ -1740,6 +1740,13 @@ class MiniTrainDIT(WeightTrainingStat):
         point_adapter_inject_every_k: int = 4,
         point_adapter_mlp_ratio: Optional[float] = None,
         point_adapter_dropout: float = 0.0,
+        # V5: decouple PC token dim from text crossattn dim.
+        # None (default) → use crossattn_emb_channels (V3/V4 backwards compat).
+        # Explicit int (e.g. 512 for dec_0 features) → use that.
+        point_adapter_d_pc: Optional[int] = None,
+        # V5: add LayerNorm to PCEncoder input — needed for dec_0 features
+        # whose magnitude is ~16× smaller than enc_out.
+        point_adapter_use_layernorm: bool = False,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
     ) -> None:
@@ -1839,9 +1846,11 @@ class MiniTrainDIT(WeightTrainingStat):
         adapter_num_heads = num_heads if point_adapter_num_heads is None else point_adapter_num_heads
         adapter_mlp_ratio = mlp_ratio if point_adapter_mlp_ratio is None else point_adapter_mlp_ratio
         adapter_dim = model_channels if point_adapter_d_a is None else point_adapter_d_a
+        # V5: decouple PC token dim from text crossattn dim
+        effective_d_pc = crossattn_emb_channels if point_adapter_d_pc is None else point_adapter_d_pc
 
         self.point_adapter = PointAdapter(
-            d_pc=crossattn_emb_channels,   # 点云 latent 原始维度，与 crossattn_emb 同维
+            d_pc=effective_d_pc,           # V5: 可与 crossattn_emb_channels 解耦（dec_0 → 512）
             d_main=model_channels,         # 主干维度 8192
             d_a=adapter_dim,
             num_adapter_blocks=point_adapter_num_adapter_blocks,
@@ -1852,6 +1861,7 @@ class MiniTrainDIT(WeightTrainingStat):
             num_main_blocks=num_blocks,    # 主干总 block 数 28
             mlp_ratio=adapter_mlp_ratio,
             dropout=point_adapter_dropout,
+            pc_encoder_use_layernorm=point_adapter_use_layernorm,  # V5: 添加 LN
             block_factory=Block,
             block_factory_kwargs=dict(
                 context_dim=crossattn_emb_channels,

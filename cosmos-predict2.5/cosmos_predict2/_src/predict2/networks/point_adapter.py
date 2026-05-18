@@ -48,13 +48,21 @@ class PCEncoder(nn.Module):
     输入 [B, T_pc, K, D_pc], 输出 [B, T_pc, K, d_a] (d_a == d_main).
     """
 
-    def __init__(self, d_pc: int, d_a: int):
+    def __init__(self, d_pc: int, d_a: int, use_layernorm: bool = False):
         super().__init__()
-        self.mlp = nn.Sequential(
+        layers = []
+        if use_layernorm:
+            # V5: normalize PC features before projection. dec_0 outputs have
+            # much smaller magnitude than enc_out (norm ~5k vs ~80k), so
+            # without LayerNorm the cross-attn K/V would be tiny and get
+            # softmax-suppressed by text tokens.
+            layers.append(nn.LayerNorm(d_pc))
+        layers.extend([
             nn.Linear(d_pc, d_a, bias=True),
             nn.SiLU(),
             nn.Linear(d_a, d_a, bias=True),
-        )
+        ])
+        self.mlp = nn.Sequential(*layers)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -86,6 +94,7 @@ class PointAdapter(nn.Module):
         dropout: float = 0.0,
         block_factory: Optional[Callable[..., nn.Module]] = None,
         block_factory_kwargs: Optional[Dict[str, Any]] = None,
+        pc_encoder_use_layernorm: bool = False,  # V5: True for dec_0 features
     ):
         super().__init__()
         del num_heads, mlp_ratio, dropout  # 通过 block_factory_kwargs 传给 Cosmos Block
@@ -132,7 +141,7 @@ class PointAdapter(nn.Module):
                 )
 
         # ── PCEncoder: D_pc → d_main, xavier init ──────────────────────────
-        self.pc_encoder = PCEncoder(d_pc=d_pc, d_a=d_a)
+        self.pc_encoder = PCEncoder(d_pc=d_pc, d_a=d_a, use_layernorm=pc_encoder_use_layernorm)
 
         # ── Adapter Blocks: 每个 inject 点一个 Cosmos Block, 与 backbone 同构 ──
         # 关键: x_dim=d_main (输入 video tokens), context_dim=d_main (PC 已投到 d_main).
