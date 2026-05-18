@@ -63,12 +63,12 @@ pc_encoder_config = dict(
     v5_feat_input="coord",
 )
 
-# Same conditioning mode probs as V3 — model still trained under
-# full / prefix / none distribution.
+# V5 4-task ablation: train only on full PC mode (no prefix/none).
+# Goal is to isolate "can model learn to use dec_0 PC info to distinguish
+# arm side", so we give it the strongest possible PC signal during training.
+# Caveat: this model won't handle PC-missing at inference; eval must use full.
 train_pc_conditioning_mode_probs = dict(
-    full=0.5,
-    prefix=0.4,
-    none=0.1,
+    full=1.0,
 )
 
 # V5: pc_latent_k=104 (was 30 in V3). Matches the K used in encode_v5_4tasks.py.

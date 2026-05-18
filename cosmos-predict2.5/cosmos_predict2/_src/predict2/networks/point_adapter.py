@@ -224,6 +224,15 @@ class PointAdapter(nn.Module):
 
         B, T, H, W, D = x_main.shape
 
+        # V5: zero out padded K positions of pc_feat before cross-attn.
+        # Without this, V5's LayerNorm in PCEncoder turns pad_value=0 into β
+        # (LN bias, may drift during training) → cross-attn sees non-zero K/V at
+        # padded positions and injects noise. Zeroing here makes K_proj(0)=K_bias
+        # (constant across padded K), so attention weight on padded ≈ uniform-low
+        # rather than random noise. Mimics V3's effective behavior with pad_value=0.
+        if pc_mask_BT_K is not None:
+            pc_feat_BT_K_da = pc_feat_BT_K_da * pc_mask_BT_K.unsqueeze(-1).to(pc_feat_BT_K_da.dtype)
+
         # ── reshape video 到 per-frame batch ──
         # Block 看到的 input shape 是 (B*T, 1, H, W, D), 内部 self-attn over (1*H*W) per frame
         x_BT_1_H_W_D = rearrange(x_main, "b t h w d -> (b t) 1 h w d")
