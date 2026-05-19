@@ -40,7 +40,7 @@ checkpoint_conf = dict(
     load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
     load_from_object_store=dict(enabled=False),
     save_to_object_store=dict(enabled=False),
-    save_iter=500,
+    save_iter=100,
 )
 
 defaults = [

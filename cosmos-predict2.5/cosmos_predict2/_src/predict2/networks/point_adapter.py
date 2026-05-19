@@ -191,6 +191,25 @@ class PointAdapter(nn.Module):
         for block in self.adapter_blocks:
             if hasattr(block, "init_weights"):
                 block.init_weights()
+            # V5 fix: undo adaLN-zero on adapter blocks. Backbone modulation
+            # came from pretrained Cosmos (non-zero, good). Adapter modulation
+            # was zero-init by Cosmos Block.reset_parameters() → gates the
+            # entire adapter contribution → 5k iter fine-tune not enough to
+            # bootstrap modulation from 0. Re-init each modulation Linear with
+            # xavier_uniform_ so adapter starts contributing from iter 1.
+            for mod_name in (
+                "adaln_modulation_self_attn",
+                "adaln_modulation_cross_attn",
+                "adaln_modulation_mlp",
+            ):
+                mod = getattr(block, mod_name, None)
+                if mod is None:
+                    continue
+                for layer in mod:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.xavier_uniform_(layer.weight)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
 
     def init_weights(self) -> None:
         """Public init hook called by MinimalV4DiT.init_weights() after the
