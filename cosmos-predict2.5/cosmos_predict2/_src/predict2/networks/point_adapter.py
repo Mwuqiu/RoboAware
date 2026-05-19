@@ -71,6 +71,13 @@ class PCEncoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                # V5 fix: previously LN was silently skipped here, causing
+                # PCEncoder.LayerNorm to land at γ=1, β=1 (uninit memory after
+                # cosmos meta→to_empty materialization). β=1 shifted PC input
+                # off-distribution and the model learned to ignore PC entirely.
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, pc: torch.Tensor) -> torch.Tensor:
         return self.mlp(pc)
@@ -167,6 +174,16 @@ class PointAdapter(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                # V5 fix: LN must be explicitly init'd here too because this is
+                # the canonical entry under cosmos meta→to_empty→init_weights().
+                # Without this, LN.weight ended up γ=1 (lucky) but LN.bias=β=1
+                # (uninit memory), corrupting PCEncoder input distribution and
+                # making the model learn to ignore PC content. Bug discovered
+                # via PC-zero ablation on V5 iter_3k showing identical output
+                # with full vs zero PC. Fix: ones_ for γ, zeros_ for β.
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
         # Each adapter Block uses the backbone Cosmos Block's own init_weights
         # (includes adaLN-zero for the modulation last layer, trunc_normal for
