@@ -102,6 +102,12 @@ class PointAdapter(nn.Module):
         block_factory: Optional[Callable[..., nn.Module]] = None,
         block_factory_kwargs: Optional[Dict[str, Any]] = None,
         pc_encoder_use_layernorm: bool = False,  # V5: True for dec_0 features
+        cross_attn_only: bool = False,  # D4-A: legacy bool, equivalent to adapter_mode="cross_attn_only"
+        adapter_mode: str = "full",     # "full" | "cross_attn_only" | "cross_attn_plus_mlp"
+        controlnet_copy_from_backbone: bool = False,  # ControlNet-style: after backbone ckpt loaded,
+                                                       # copy backbone[inject_id] sublayer weights into adapter[i].
+                                                       # Sets adaln_modulation to zero (ControlNet zero-conv style).
+                                                       # k_proj/v_proj of cross_attn stay random (modality mismatch).
     ):
         super().__init__()
         del num_heads, mlp_ratio, dropout  # 通过 block_factory_kwargs 传给 Cosmos Block
@@ -122,6 +128,36 @@ class PointAdapter(nn.Module):
         self.d_a = d_a
         self.d_main = d_main
         self.adapter_block_depth = 1
+        # Adapter mode (which sublayers of the Cosmos Block to run in apply_stage):
+        #   "full"                — D3/D4 baseline: self-attn + cross-attn + MLP all run.
+        #                            ❌ self-attn / MLP form a PC-independent downhill path
+        #                            so optimizer never learns to use cross-attn properly.
+        #   "cross_attn_only"     — D4-A: only run cross-attn sublayer. Forces the only
+        #                            PC channel to be the sole residual. ✅ trains content
+        #                            sensitivity (zero=0.59 rel_L2) but capacity-limited.
+        #   "cross_attn_plus_mlp" — D4-B (FAILED): cross-attn + MLP. MLP eats LN(x_after_ca)
+        #                            = LN(x_main + delta_ca). When delta_ca << x_main (which
+        #                            it always is at init), MLP effectively eats LN(x_main).
+        #                            Verified empirically at iter_500→750: delta_mlp/delta_ca
+        #                            grew 82× → 148×, PC sensitivity collapsed 0.066 → 0.008.
+        #                            MLP became PC-independent x_main bypass = same failure
+        #                            as full Block's self-attn. Kept for reproducibility.
+        #   "cross_attn_then_mlp" — D4-B' (NEW): MLP eats LN(delta_ca) only. If delta_ca → 0
+        #                            then LN(0) = 0 and MLP outputs constant bias (no spatial
+        #                            structure). MLP can only AMPLIFY / DECODE cross-attn
+        #                            output, not bypass it. gate_mlp zero-init for gradual
+        #                            wake-up; iter 0 behaves like D4-A.
+        valid_modes = {"full", "cross_attn_only", "cross_attn_plus_mlp", "cross_attn_then_mlp"}
+        if bool(cross_attn_only) and adapter_mode == "full":
+            # Backward compat: legacy bool flag mapped to "cross_attn_only".
+            adapter_mode = "cross_attn_only"
+        if adapter_mode not in valid_modes:
+            raise ValueError(f"adapter_mode must be one of {valid_modes}, got {adapter_mode!r}")
+        self.adapter_mode = adapter_mode
+        # Keep the legacy attribute name for any external probe / ckpt diag code.
+        self.cross_attn_only = adapter_mode == "cross_attn_only"
+        self.controlnet_copy = bool(controlnet_copy_from_backbone)
+        self._controlnet_copy_done = False
 
         # ── 注入点解析 (与原版一致) ─────────────────────────────────────────
         if inject_block_ids is not None:
@@ -197,6 +233,13 @@ class PointAdapter(nn.Module):
             # entire adapter contribution → 5k iter fine-tune not enough to
             # bootstrap modulation from 0. Re-init each modulation Linear with
             # xavier_uniform_ so adapter starts contributing from iter 1.
+            #
+            # D4-B exception: when adapter_mode == "cross_attn_plus_mlp", the
+            # MLP modulation is zero-init so MLP gate = 0 → MLP contributes 0
+            # at iter 0, behaving like D4-A initially. MLP wakes up gradually
+            # only if its capacity helps lower the loss. This lets us *add*
+            # MLP without disturbing the trained-cross-attn equilibrium.
+            mlp_zero_init = self.adapter_mode in ("cross_attn_plus_mlp", "cross_attn_then_mlp")
             for mod_name in (
                 "adaln_modulation_self_attn",
                 "adaln_modulation_cross_attn",
@@ -205,9 +248,13 @@ class PointAdapter(nn.Module):
                 mod = getattr(block, mod_name, None)
                 if mod is None:
                     continue
+                use_zero = mlp_zero_init and mod_name == "adaln_modulation_mlp"
                 for layer in mod:
                     if isinstance(layer, nn.Linear):
-                        nn.init.xavier_uniform_(layer.weight)
+                        if use_zero:
+                            nn.init.zeros_(layer.weight)
+                        else:
+                            nn.init.xavier_uniform_(layer.weight)
                         if layer.bias is not None:
                             nn.init.zeros_(layer.bias)
 
@@ -215,6 +262,187 @@ class PointAdapter(nn.Module):
         """Public init hook called by MinimalV4DiT.init_weights() after the
         framework's meta -> cpu / meta -> cuda materialization. See `_init_weights`."""
         self._init_weights()
+
+    @torch.no_grad()
+    def controlnet_copy_from_backbone(self, backbone_blocks: nn.ModuleList) -> None:
+        """ControlNet-style adapter init: copy modality-agnostic weights from backbone
+        blocks at inject points into adapter blocks. Must be called AFTER backbone
+        pretrained ckpt is loaded (e.g. from on_train_start).
+
+        Copied (matching shapes verified):
+          - self_attn.{q,k,v,output}_proj.weight, self_attn.{q,k}_norm.weight
+          - cross_attn.q_proj.weight, cross_attn.output_proj.weight,
+            cross_attn.{q,k}_norm.weight
+          - mlp.layer{1,2}.weight
+
+        NOT copied (modality / shape mismatch):
+          - cross_attn.k_proj.weight, cross_attn.v_proj.weight  (text emb is 1024-d,
+            our PC tokens are 2048-d; also semantics differ). Kept at random init.
+          - adaln_modulation_{self_attn,cross_attn,mlp}.{1,2}.weight  (backbone uses
+            AdaLN-LoRA: 2048→256→6144; adapter uses single 2048→6144). Zero-init
+            as ControlNet "zero conv" — adapter contributes 0 at iter 0.
+
+        Idempotent: subsequent calls are no-ops.
+        """
+        if self._controlnet_copy_done:
+            return
+        if not self.controlnet_copy:
+            return
+
+        # Resume safety: if adapter has been trained (resuming from ckpt), skip
+        # the copy so we don't overwrite trained weights with backbone init.
+        #
+        # We probe adaln_modulation_MLP gate rows (NOT cross_attn). Reason:
+        # _init_weights() zero-inits ALL Linears of mlp modulation (only mlp in
+        # mlp_zero_init mode), so fresh init has mlp gate rows = 0 exactly.
+        # After any training, gradient grows them. Cross/self modulation rows
+        # have xavier-init values ~3e-2 even at fresh init (verified 2026-05-22),
+        # which made the previous threshold check trigger incorrectly on fresh
+        # launch. MLP gate is a clean 0→trained signal.
+        try:
+            sample_adaln = self.adapter_blocks[0].adaln_modulation_mlp
+            lins = [m for m in sample_adaln if isinstance(m, nn.Linear)]
+            if len(lins) >= 2:
+                layer_B = lins[-1]
+                out_dim = layer_B.weight.shape[0]
+                D = out_dim // 3
+                gate_max = layer_B.weight[2 * D:].detach().abs().max().item()
+                if gate_max > 1e-6:
+                    print(
+                        f"[PointAdapter] ControlNet copy SKIPPED — mlp gate_max={gate_max:.3e} > 1e-6, "
+                        f"adapter appears already trained (resume from ckpt). "
+                        f"Not overwriting trained weights.",
+                        flush=True,
+                    )
+                    self._controlnet_copy_done = True
+                    return
+        except Exception as e:
+            print(f"[PointAdapter] gate-state check raised {e!r}, proceeding with copy.", flush=True)
+
+        # sublayers with leaf nn.Linear named "<module>.<attr>"
+        LINEAR_PATHS = [
+            ("self_attn", "q_proj"), ("self_attn", "k_proj"),
+            ("self_attn", "v_proj"), ("self_attn", "output_proj"),
+            ("cross_attn", "q_proj"), ("cross_attn", "output_proj"),
+            ("mlp", "layer1"), ("mlp", "layer2"),
+        ]
+        # tensor leaves (RMSNorm with just .weight)
+        TENSOR_PATHS = [
+            ("self_attn", "q_norm"), ("self_attn", "k_norm"),
+            ("cross_attn", "q_norm"), ("cross_attn", "k_norm"),
+        ]
+
+        copied = 0
+        skipped = 0
+        for i, blk_id in enumerate(self.inject_block_ids):
+            src_blk = backbone_blocks[blk_id]
+            dst_blk = self.adapter_blocks[i]
+
+            for mod_name, attr in LINEAR_PATHS:
+                src_mod = getattr(src_blk, mod_name, None)
+                dst_mod = getattr(dst_blk, mod_name, None)
+                if src_mod is None or dst_mod is None:
+                    skipped += 1
+                    continue
+                src_lin = getattr(src_mod, attr, None)
+                dst_lin = getattr(dst_mod, attr, None)
+                if src_lin is None or dst_lin is None:
+                    skipped += 1
+                    continue
+                if src_lin.weight.shape != dst_lin.weight.shape:
+                    skipped += 1
+                    continue
+                dst_lin.weight.copy_(src_lin.weight)
+                if (getattr(src_lin, "bias", None) is not None
+                        and getattr(dst_lin, "bias", None) is not None):
+                    dst_lin.bias.copy_(src_lin.bias)
+                copied += 1
+
+            for mod_name, attr in TENSOR_PATHS:
+                src_mod = getattr(src_blk, mod_name, None)
+                dst_mod = getattr(dst_blk, mod_name, None)
+                if src_mod is None or dst_mod is None:
+                    continue
+                src_norm = getattr(src_mod, attr, None)
+                dst_norm = getattr(dst_mod, attr, None)
+                if src_norm is None or dst_norm is None:
+                    continue
+                if getattr(src_norm, "weight", None) is None or getattr(dst_norm, "weight", None) is None:
+                    continue
+                if src_norm.weight.shape == dst_norm.weight.shape:
+                    dst_norm.weight.copy_(src_norm.weight)
+                    copied += 1
+
+            # adaLN modulation: timestep-modulation inheritance + gate-zero.
+            # Backbone uses AdaLN-LoRA: nn.Sequential(SiLU, Linear(D, d_lora), Linear(d_lora, 3D)).
+            # Adapter now also uses LoRA (use_adaln_lora=True). Both have len([Linear])==2.
+            # - Linear A (D, d_lora): copy from backbone — modality-agnostic timestep encoding.
+            # - Linear B (d_lora, 3D): output is chunked into [shift, scale, gate]:
+            #     shift rows [0   .. D-1]   ← copy from backbone (inherit timestep curve)
+            #     scale rows [D   .. 2D-1]  ← copy from backbone (inherit timestep curve)
+            #     gate  rows [2D  .. 3D-1]  ← ZERO (ControlNet "zero conv": adapter silent at iter 0)
+            # When gate gradient turns gate non-zero, adapter immediately produces
+            # well-shaped timestep-aware shift/scale residuals (vs learning t→shift/scale from scratch).
+            for adaln_name in (
+                "adaln_modulation_self_attn",
+                "adaln_modulation_cross_attn",
+                "adaln_modulation_mlp",
+            ):
+                src_mod = getattr(src_blk, adaln_name, None)
+                dst_mod = getattr(dst_blk, adaln_name, None)
+                if src_mod is None or dst_mod is None:
+                    continue
+                src_lins = [m for m in src_mod if isinstance(m, nn.Linear)]
+                dst_lins = [m for m in dst_mod if isinstance(m, nn.Linear)]
+                if len(src_lins) != 2 or len(dst_lins) != 2:
+                    # Structural mismatch (e.g. one is LoRA, the other isn't) — fall back
+                    # to pure zero-init so adapter stays silent.
+                    for layer in dst_mod:
+                        if isinstance(layer, nn.Linear):
+                            nn.init.zeros_(layer.weight)
+                            if layer.bias is not None:
+                                nn.init.zeros_(layer.bias)
+                    skipped += 1
+                    continue
+                src_A, dst_A = src_lins[0], dst_lins[0]
+                src_B, dst_B = src_lins[1], dst_lins[1]
+                # Linear A: full copy (modality-agnostic timestep encoder)
+                if src_A.weight.shape == dst_A.weight.shape:
+                    dst_A.weight.copy_(src_A.weight)
+                    if src_A.bias is not None and dst_A.bias is not None:
+                        dst_A.bias.copy_(src_A.bias)
+                else:
+                    nn.init.zeros_(dst_A.weight)
+                    if dst_A.bias is not None:
+                        nn.init.zeros_(dst_A.bias)
+                # Linear B: build [backbone_shift, backbone_scale, zeros_gate] via
+                # torch.cat — avoids any in-place slice-fill (DTensor doesn't
+                # support `aten.fill_.Tensor` on shards; that's exactly why the
+                # previous `weight[2*D:] = 0` was a silent no-op under FSDP).
+                if src_B.weight.shape == dst_B.weight.shape:
+                    out_dim = dst_B.weight.shape[0]
+                    D = out_dim // 3
+                    keep = src_B.weight[: 2 * D]                            # slicing view = OK
+                    zero_gate = torch.zeros_like(src_B.weight[2 * D :])     # new tensor = OK
+                    new_W = torch.cat([keep, zero_gate], dim=0)             # cat returns full tensor
+                    dst_B.weight.copy_(new_W)                                # full-Parameter copy = works
+                    if src_B.bias is not None and dst_B.bias is not None:
+                        keep_b = src_B.bias[: 2 * D]
+                        zero_gate_b = torch.zeros_like(src_B.bias[2 * D :])
+                        new_b = torch.cat([keep_b, zero_gate_b], dim=0)
+                        dst_B.bias.copy_(new_b)
+                else:
+                    nn.init.zeros_(dst_B.weight)
+                    if dst_B.bias is not None:
+                        nn.init.zeros_(dst_B.bias)
+                copied += 2  # A + B (gate-zeroed)
+
+        self._controlnet_copy_done = True
+        print(
+            f"[PointAdapter] ControlNet copy DONE: copied={copied} skipped={skipped} "
+            f"blocks={self.inject_block_ids}",
+            flush=True,
+        )
 
     # ───────────────────────── 时间维度对齐 ────────────────────────────────
     @staticmethod
@@ -288,17 +516,102 @@ class PointAdapter(nn.Module):
 
         # ── 调用同构 Cosmos Block, cross-attn K/V = 当前 latent t 的 PC token ──
         block = self.adapter_blocks[adapter_idx]
-        out_BT_1_H_W_D = block(
-            x_BT_1_H_W_D,
-            emb_BT_1_D,
-            pc_feat_BT_K_da,            # crossattn_emb 替换为 PC tokens [B*T, K, D]
-            rope_emb_L_1_1_D=None,      # adapter 内部 self-attn 不需要 RoPE (per-frame spatial)
-            adaln_lora_B_T_3D=None,     # use_adaln_lora=False (跟 backbone 配置一致)
-            extra_per_block_pos_emb=None,
-        )
 
-        # delta = Block(x) - x; adaLN-zero 保证初始 delta ≈ 0
-        delta_BT_1_H_W_D = out_BT_1_H_W_D - x_BT_1_H_W_D
+        if self.adapter_mode in ("cross_attn_only", "cross_attn_plus_mlp", "cross_attn_then_mlp"):
+            # D4-A / D4-B: bypass self-attn inside Block. Run only:
+            #   D4-A: cross-attn path (LN + adaln + cross-attn + gate)
+            #   D4-B: cross-attn path + MLP path (LN + adaln + MLP + gate, zero-init MLP gate)
+            # Self-attn (PC-independent token mixing) is skipped → closes the
+            # "self-attn refinement of x_main" bypass that lets adapter lower
+            # loss without learning PC content.
+            #
+            # Reference (Block.forward, minimal_v4_dit.py:1338-1444):
+            #   x ← x + gate_self  * self_attn(LN(x))           ← SKIPPED in D4-A/B
+            #   x ← x + gate_cross * cross_attn(LN(x), pc_feat) ← RUN both
+            #   x ← x + gate_mlp   * mlp(LN(x))                 ← D4-B only (zero-init gate)
+            #
+            # Dtype: adapter is cast to bf16 (text2world_model_rectified_flow.py:258),
+            # but emb / pc_feat / x may arrive in fp32 (e.g. t_embedder under
+            # autocast(enabled=False)). Cast inputs to adapter weight dtype to
+            # avoid mat1/mat2 dtype mismatch in the Linear ops.
+            ada_dtype = block.adaln_modulation_cross_attn[1].weight.dtype
+            emb_for_mod = emb_BT_1_D.to(ada_dtype)
+            x_for_mod = x_BT_1_H_W_D.to(ada_dtype)
+            pc_for_attn = pc_feat_BT_K_da.to(ada_dtype)
+
+            # ── Cross-attn portion (always on for D4-A/B) ────────────────────
+            mod_ca = block.adaln_modulation_cross_attn(emb_for_mod)
+            shift_ca_BT_1_D, scale_ca_BT_1_D, gate_ca_BT_1_D = mod_ca.chunk(3, dim=-1)
+            shift_ca = rearrange(shift_ca_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+            scale_ca = rearrange(scale_ca_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+            gate_ca = rearrange(gate_ca_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+            # D4-C gate-offset REMOVED (2026-05-22 audit). Original premise
+            # ("bf16 quantization makes per-step Adam update below quantum →
+            # cross_attn weights stuck at init") was disproved by weight_diff —
+            # actual drift is 0.3-1.5% over 750 iter, slow but not stuck.
+            # Adding +1.0 also violated ControlNet "zero conv" principle: with
+            # gate_ca + 1.0 at iter 0, adapter contributes random ca_out from
+            # step 0 (random because k_proj/v_proj are random init for PC).
+            # With sliced-copy bug fixed (gate rows now properly zero-initialized),
+            # gate_ca starts at 0 naturally → adapter silent at iter 0 → standard
+            # ControlNet behavior. Gradient still flows to gate rows via chain
+            # rule even when gate=0 (delta_ca = ca_out * gate, ∂loss/∂gate is
+            # non-zero as long as ∂loss/∂delta_ca is non-zero — which it is
+            # because backbone has many other paths contributing to loss).
+            # If training stalls or PC swap effect doesn't emerge with this fix,
+            # the original line was:
+            #     gate_ca = gate_ca + 1.0
+
+            normed_ca = block.layer_norm_cross_attn(x_for_mod) * (1 + scale_ca) + shift_ca
+            ca_out_BT_HW_D = block.cross_attn(
+                rearrange(normed_ca, "bt one h w d -> bt (one h w) d"),
+                pc_for_attn,
+                rope_emb=None,
+            )
+            ca_out_BT_1_H_W_D = rearrange(
+                ca_out_BT_HW_D, "bt (one h w) d -> bt one h w d", one=1, h=H, w=W
+            )
+            delta_ca = ca_out_BT_1_H_W_D * gate_ca
+
+            if self.adapter_mode in ("cross_attn_plus_mlp", "cross_attn_then_mlp"):
+                # ── MLP portion ──────────────────────────────────────────────
+                # cross_attn_plus_mlp (D4-B): MLP eats x + delta_ca = mostly x_main.
+                #   Empirically lets MLP bypass to x_main and ignore PC.
+                # cross_attn_then_mlp (D4-B'): MLP eats delta_ca only. If delta_ca=0
+                #   then LN(0)=0, MLP outputs only constant bias (no spatial freedom).
+                #   MLP can only amplify cross-attn output; cannot bypass.
+                # Both zero-init gate_mlp for gradual wake-up.
+                if self.adapter_mode == "cross_attn_plus_mlp":
+                    mlp_input = x_for_mod + delta_ca         # ❌ x_main bypass risk
+                else:
+                    mlp_input = delta_ca                     # ✅ pure PC-derived
+
+                mod_mlp = block.adaln_modulation_mlp(emb_for_mod)
+                shift_mlp_BT_1_D, scale_mlp_BT_1_D, gate_mlp_BT_1_D = mod_mlp.chunk(3, dim=-1)
+                shift_mlp = rearrange(shift_mlp_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+                scale_mlp = rearrange(scale_mlp_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+                gate_mlp = rearrange(gate_mlp_BT_1_D, "bt one d -> bt one 1 1 d").type_as(x_for_mod)
+
+                normed_mlp = block.layer_norm_mlp(mlp_input) * (1 + scale_mlp) + shift_mlp
+                mlp_out = block.mlp(normed_mlp)
+                delta_mlp = mlp_out * gate_mlp
+
+                delta_BT_1_H_W_D = (delta_ca + delta_mlp).to(x_BT_1_H_W_D.dtype)
+            else:
+                # D4-A: cross-attn only
+                delta_BT_1_H_W_D = delta_ca.to(x_BT_1_H_W_D.dtype)
+        else:
+            out_BT_1_H_W_D = block(
+                x_BT_1_H_W_D,
+                emb_BT_1_D,
+                pc_feat_BT_K_da,            # crossattn_emb 替换为 PC tokens [B*T, K, D]
+                rope_emb_L_1_1_D=None,      # adapter 内部 self-attn 不需要 RoPE (per-frame spatial)
+                adaln_lora_B_T_3D=None,     # use_adaln_lora=False (跟 backbone 配置一致)
+                extra_per_block_pos_emb=None,
+            )
+            # delta = Block(x) - x; adaLN-zero 保证初始 delta ≈ 0
+            delta_BT_1_H_W_D = out_BT_1_H_W_D - x_BT_1_H_W_D
+
         delta_B_T_H_W_D = rearrange(delta_BT_1_H_W_D, "(b t) 1 h w d -> b t h w d", b=B, t=T)
 
         # ── frame-level mask: PC 不可见的帧强制 0 (prefix 后段 / none mode) ──
