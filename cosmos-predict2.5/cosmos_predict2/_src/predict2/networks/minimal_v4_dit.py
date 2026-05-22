@@ -1747,6 +1747,16 @@ class MiniTrainDIT(WeightTrainingStat):
         # V5: add LayerNorm to PCEncoder input — needed for dec_0 features
         # whose magnitude is ~16× smaller than enc_out.
         point_adapter_use_layernorm: bool = False,
+        # D4-A: when True, each adapter Block only runs its cross-attn path
+        # (skip self-attn + MLP). Closes the "self-attn/MLP refines x_main"
+        # bypass that lets the adapter lower loss without learning to use PC.
+        point_adapter_cross_attn_only: bool = False,
+        # Adapter sublayer mode (preferred over the boolean above):
+        #   "full" | "cross_attn_only" | "cross_attn_plus_mlp"  (see PointAdapter)
+        point_adapter_adapter_mode: str = "full",
+        # ControlNet-style adapter init: copy backbone[inject_id] weights into adapter[i]
+        # AFTER backbone pretrained ckpt loaded. See PointAdapter.controlnet_copy_from_backbone.
+        point_adapter_controlnet_copy: bool = False,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
     ) -> None:
@@ -1862,12 +1872,15 @@ class MiniTrainDIT(WeightTrainingStat):
             mlp_ratio=adapter_mlp_ratio,
             dropout=point_adapter_dropout,
             pc_encoder_use_layernorm=point_adapter_use_layernorm,  # V5: 添加 LN
+            cross_attn_only=point_adapter_cross_attn_only,         # D4-A (legacy bool)
+            adapter_mode=point_adapter_adapter_mode,               # D4-A / D4-B mode enum
+            controlnet_copy_from_backbone=point_adapter_controlnet_copy,
             block_factory=Block,
             block_factory_kwargs=dict(
                 context_dim=crossattn_emb_channels,
                 num_heads=adapter_num_heads,
                 mlp_ratio=adapter_mlp_ratio,
-                use_adaln_lora=False,
+                use_adaln_lora=True,            # Align with backbone (AdaLN-LoRA): enables timestep modulation copy in ControlNet path.
                 adaln_lora_dim=adaln_lora_dim,
                 backend=atten_backend,
                 image_context_dim=None,
@@ -1900,6 +1913,15 @@ class MiniTrainDIT(WeightTrainingStat):
         # self.point_adapter is constructed.)
         if hasattr(self, "point_adapter"):
             self.point_adapter.init_weights()
+
+    def controlnet_init_adapter_from_backbone(self) -> None:
+        """ControlNet-style adapter weight copy. Call AFTER backbone ckpt is loaded.
+
+        Idempotent. No-op if controlnet_copy=False on the PointAdapter.
+        """
+        if not hasattr(self, "point_adapter"):
+            return
+        self.point_adapter.controlnet_copy_from_backbone(self.blocks)
 
     def build_patch_embed(self):
         (

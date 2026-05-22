@@ -340,6 +340,15 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             self.net_ema.to(dtype=torch.float32)
         if hasattr(self.tokenizer, "reset_dtype"):
             self.tokenizer.reset_dtype()
+
+        # ControlNet-style adapter init: copy backbone weights into adapter blocks.
+        # Must happen AFTER load_state_dict (backbone pretrained loaded) but BEFORE
+        # the net is cast / compiled below. No-op if point_adapter_controlnet_copy=False.
+        if hasattr(self.net, "controlnet_init_adapter_from_backbone"):
+            self.net.controlnet_init_adapter_from_backbone()
+        if self.config.ema.enabled and hasattr(self.net_ema, "controlnet_init_adapter_from_backbone"):
+            self.net_ema.controlnet_init_adapter_from_backbone()
+
         self.net = self.net.to(memory_format=memory_format, **self.tensor_kwargs)
 
         if hasattr(self.config, "use_torch_compile") and self.config.use_torch_compile:  # compatible with old config
