@@ -140,17 +140,35 @@ class PTV3Encoder(torch.nn.Module):
         self.enc = (
             ptv3_model.backbone.enc if hasattr(ptv3_model, "backbone") else ptv3_model.enc
         )
+        bb = ptv3_model.backbone if hasattr(ptv3_model, "backbone") else ptv3_model
+        self.dec_0 = list(bb.dec.children())[0] if hasattr(bb, "dec") else None
 
     # This encoder is used in the dataloader as an auxiliary preprocessing path.
     # Keeping it eager avoids long first-step TorchInductor compilation stalls.
     @torch.compiler.disable
-    def forward(self, data_dict):
+    def forward(self, data_dict, *, extract_layer: str = "enc_out"):
+        """Forward through PTV3.
+
+        extract_layer:
+          - "enc_out" (default, backward-compat): output from last encoder stage
+            (D=1024 for ptv3-base or 512 for semseg-pt-v3m1-0-base).
+          - "dec_0": run one decoder stage on top of enc_out (V5 setup, D=512,
+            ~half the token count of enc_out due to upsampling structure).
+        Note: caller is responsible for setting data_dict['feat'] correctly.
+        For V5: feat = coord.clone(); for legacy: feat = zeros(N, in_ch).
+        """
         point = Point(data_dict)
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
         point = self.embedding(point)
         point = self.enc(point)
+        if extract_layer == "dec_0":
+            if self.dec_0 is None:
+                raise RuntimeError("dec_0 requested but model has no decoder")
+            point = self.dec_0(point)
+        elif extract_layer != "enc_out":
+            raise ValueError(f"Unsupported extract_layer={extract_layer!r}")
         return point
 
     @torch.compiler.disable
@@ -281,6 +299,8 @@ class PTV3Encoder(torch.nn.Module):
         return_mask: bool = True,
         amp: bool = False,
         progress_callback=None,
+        feat_input: str = "zeros",
+        extract_layer: str = "enc_out",
     ):
         """Batch encode a list of sequence data_dicts.
 
@@ -288,10 +308,13 @@ class PTV3Encoder(torch.nn.Module):
         Returns:
           - feats: Tensor (B, T, k, C)
           - masks: Tensor (B, T, k) bool (if return_mask)
-        Notes: Uses per-time-step concatenation to run one forward per time-step for the whole batch.
 
-        Important: After serialization + sparsify + spconv/transformer, the output token count is NOT equal to total input points.
-        So we must split the output by `p.batch` (token ownership) instead of slicing by original `Ns`.
+        feat_input: "zeros" (legacy) or "coord" (V5 — copies xyz into feat channels).
+        extract_layer: "enc_out" (legacy) or "dec_0" (V5 — one decoder stage above enc).
+
+        V5 setup (feat_input="coord", extract_layer="dec_0") gives D=512 features
+        with arm-side AUC=1.0 on linear probe; legacy gives feat=0+enc_out (D=512
+        on semseg-pt-v3m1-0-base) with arm-side AUC≈0.74.
         """
         if not isinstance(batch_data, (list, tuple)):
             batch_data = list(batch_data)
@@ -351,7 +374,12 @@ class PTV3Encoder(torch.nn.Module):
 
             # offset should be prefix sums (cumulative counts)
             offset = torch.tensor(np.cumsum(Ns), dtype=torch.long, device=device)
-            feat_init = torch.zeros((total_N, int(in_ch)), dtype=torch.float32, device=device)
+            if feat_input == "coord":
+                feat_init = coords_cat.clone()
+            elif feat_input == "zeros":
+                feat_init = torch.zeros((total_N, int(in_ch)), dtype=torch.float32, device=device)
+            else:
+                raise ValueError(f"Unsupported feat_input={feat_input!r}")
 
             single = {"coord": coords_cat, "batch": batch_idx, "offset": offset, "feat": feat_init}
             if grid_size is not None:
@@ -360,9 +388,9 @@ class PTV3Encoder(torch.nn.Module):
             with torch.no_grad():
                 if amp and torch.cuda.is_available():
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        p = self.forward(single)
+                        p = self.forward(single, extract_layer=extract_layer)
                 else:
-                    p = self.forward(single)
+                    p = self.forward(single, extract_layer=extract_layer)
 
             pts_feat = p.get("feat") if hasattr(p, "get") else getattr(p, "feat", None)
             pts_batch = p.get("batch") if hasattr(p, "get") else getattr(p, "batch", None)

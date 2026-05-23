@@ -131,6 +131,8 @@ class VideoDataset(Dataset):
         pc_encoder_config: Optional[dict] = None,
         pc_conditioning_mode_probs: Optional[dict[str, float]] = None,
         pc_conditioning_prefix_frames: int | list[int] | tuple[int, ...] = 2,
+        pc_feat_input: str = "zeros",
+        pc_extract_layer: str = "enc_out",
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -160,6 +162,8 @@ class VideoDataset(Dataset):
         self.pc_latent_amp = bool(pc_latent_amp)
         self.pc_latent_grid_size = float(pc_latent_grid_size)
         self.pc_encoder_config = pc_encoder_config
+        self.pc_feat_input = pc_feat_input
+        self.pc_extract_layer = pc_extract_layer
         self.pc_conditioning_mode_probs = self._normalize_pc_conditioning_mode_probs(pc_conditioning_mode_probs)
         self.pc_conditioning_prefix_frames = self._normalize_pc_conditioning_prefix_frames(
             pc_conditioning_prefix_frames
@@ -341,6 +345,8 @@ class VideoDataset(Dataset):
             pad_value=self.pc_latent_pad_value,
             return_mask=True,
             amp=self.pc_latent_amp,
+            feat_input=self.pc_feat_input,
+            extract_layer=self.pc_extract_layer,
         )
         return feats[0].detach().cpu(), mask[0].detach().cpu().bool()
 

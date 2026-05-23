@@ -124,6 +124,8 @@ def preencode_one_dataset(
     grid_size: float,
     shard_id: int = 0,
     num_shards: int = 1,
+    feat_input: str = "zeros",
+    extract_layer: str = "enc_out",
 ):
     ds = CosmosPointcloudEpisodeDataset(dataset_dir)
     out_dir = os.path.join(os.path.abspath(dataset_dir), "pc_latent")
@@ -188,7 +190,23 @@ def preencode_one_dataset(
             pad_value=float(pad_value),
             return_mask=True,
             amp=bool(amp),
+            feat_input=feat_input,
+            extract_layer=extract_layer,
         )
+
+        enc_meta = {
+            "DATASET": pf_encoder.DATASET,
+            "CONFIG": pf_encoder.CONFIG,
+            "EXP_NAME": pf_encoder.EXP_NAME,
+            "WEIGHT_NAME": pf_encoder.WEIGHT_NAME,
+            "CONFIG_FILE": pf_encoder.CONFIG_FILE,
+            "EXP_DIR": pf_encoder.EXP_DIR,
+            "WEIGHT_PATH": pf_encoder.WEIGHT_PATH,
+            "feat_input": feat_input,
+            "extract_layer": extract_layer,
+        }
+        if feat_input == "coord" and extract_layer == "dec_0":
+            enc_meta["v5_diff_vs_v3"] = f"feat=coord + dec_0 extraction (dim 512, K={int(k)})"
 
         payload = {
             "x0": feats[0].detach().cpu(),          # [T, k, C] (your code calls this k, but it's L in other parts)
@@ -197,15 +215,7 @@ def preencode_one_dataset(
             "k": int(k),
             "sample": str(sample),
             "pad_value": float(pad_value),
-            "encoder": {
-                "DATASET": pf_encoder.DATASET,
-                "CONFIG": pf_encoder.CONFIG,
-                "EXP_NAME": pf_encoder.EXP_NAME,
-                "WEIGHT_NAME": pf_encoder.WEIGHT_NAME,
-                "CONFIG_FILE": pf_encoder.CONFIG_FILE,
-                "EXP_DIR": pf_encoder.EXP_DIR,
-                "WEIGHT_PATH": pf_encoder.WEIGHT_PATH,
-            },
+            "encoder": enc_meta,
         }
         torch.save(payload, out_path)
         written += 1
@@ -256,7 +266,28 @@ def main():
         default=int(os.environ.get("LOCAL_RANK", "0")),
         help="Local CUDA device index. Defaults to LOCAL_RANK when launched with torchrun.",
     )
+    ap.add_argument(
+        "--feat_input",
+        choices=["zeros", "coord"],
+        default="zeros",
+        help="Initial feat fed to PTV3 embedding. 'coord' is V5 setup (arm-side AUC=1.0).",
+    )
+    ap.add_argument(
+        "--extract_layer",
+        choices=["enc_out", "dec_0"],
+        default="enc_out",
+        help="Which PTV3 stage to read latents from. 'dec_0' is V5 setup.",
+    )
+    ap.add_argument(
+        "--v5",
+        action="store_true",
+        help="Shortcut for --feat_input=coord --extract_layer=dec_0 (V5 setup).",
+    )
     args = ap.parse_args()
+
+    if args.v5:
+        args.feat_input = "coord"
+        args.extract_layer = "dec_0"
 
     if args.num_shards <= 0:
         raise ValueError(f"--num_shards must be >= 1, got {args.num_shards}")
@@ -318,6 +349,8 @@ def main():
             grid_size=float(args.grid_size),
             shard_id=args.shard_id,
             num_shards=args.num_shards,
+            feat_input=args.feat_input,
+            extract_layer=args.extract_layer,
         )
         total_wrote += stats["wrote"]
         total_skipped += stats["skipped"]
