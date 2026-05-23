@@ -13,9 +13,16 @@
 # (modality-different) + adaLN modulation (zero-init "zero conv") need to learn.
 #
 # Diffs vs v5_cross_attn_then_mlp_4tasks (parent):
-#   - point_adapter_controlnet_copy=True
-#   - batch_size=1 (single 96GB GPU on westd)
+#   - point_adapter_controlnet_copy=True (ControlNet weight copy from backbone
+#     inject-point blocks, post-bug-fix using torch.cat full-tensor approach)
+#   - point_adapter use_adaln_lora=True (set in minimal_v4_dit.py for adapter)
+#   - batch_size=2 / GPU (4-GPU A800, effective batch=8)
+#   - save_iter=500, max_iter=8000
 #   - new experiment_name + output dir
+#
+# Verified at iter_1000: adapter LinearB shift/scale rows successfully inherit
+# backbone trained values (shift_m=3.04e-3, scale_m=1.69e-2 match backbone);
+# gate rows zero-init then grow via gradient (gate_m at iter_1000 ≈ 3.85e-4).
 
 from hydra.core.config_store import ConfigStore
 
@@ -40,7 +47,7 @@ checkpoint_conf = dict(
     load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
     load_from_object_store=dict(enabled=False),
     save_to_object_store=dict(enabled=False),
-    save_iter=100,    # frequent ckpts early — test PC swap behavior often
+    save_iter=500,    # post-bug-fix default (was overridden via CLI; baked in here)
 )
 
 defaults = [
@@ -89,7 +96,7 @@ dataset_val = L(VideoDataset)(
 dataloader_train = L(get_generic_dataloader)(
     dataset=dataset_train,
     sampler=L(get_sampler)(dataset=dataset_train),
-    batch_size=1,    # single 96GB GPU on westd
+    batch_size=2,    # 4-GPU A800; effective batch 8
     drop_last=True,
     num_workers=12,
     pin_memory=True,
@@ -100,7 +107,7 @@ dataloader_train = L(get_generic_dataloader)(
 dataloader_val = L(get_generic_dataloader)(
     dataset=dataset_val,
     sampler=L(get_sampler)(dataset=dataset_val),
-    batch_size=1,    # single 96GB GPU on westd
+    batch_size=2,    # 4-GPU A800; effective batch 8
     drop_last=True,
     num_workers=12,
     pin_memory=True,
@@ -124,7 +131,7 @@ trainer_conf = dict(
     run_validation=False,
     validation_iter=2000,
     logging_iter=25,
-    max_iter=5000,
+    max_iter=8000,    # post-bug-fix default
     callbacks=dict(
         heart_beat=dict(save_s3=False),
         iter_speed=dict(hit_thres=200, save_s3=False),
