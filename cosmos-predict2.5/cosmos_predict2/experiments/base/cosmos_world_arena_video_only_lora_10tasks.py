@@ -65,8 +65,21 @@ _lora_defaults = [
     "_self_",
 ]
 
+# IMPORTANT: load_path must be the DIRECT local .pt of the base model, NOT
+# DEFAULT_CHECKPOINT.s3.uri. The s3.uri points to a DCP dir ("...iter_000023000",
+# no .pt suffix); the loader keys format off the suffix, treats it as DCP, and with
+# object-store disabled silently loads NOTHING -> model trains from init -> loss ~3.0
+# instead of ~0.03. Use the consolidated ema_bf16.pt that HF actually caches.
+BASE_CKPT = (
+    "/root/autodl-tmp/cache/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/"
+    "15a82a2ec231bc318692aa0456a36537c806e7d4/base/pre-trained/"
+    "d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
+)
 _lora_checkpoint_base = dict(
-    load_path=DEFAULT_CHECKPOINT.s3.uri,
+    load_path=BASE_CKPT,
+    load_training_state=False,
+    strict_resume=True,
+    load_ema_to_reg=False,
     load_from_object_store=dict(enabled=False),
     save_to_object_store=dict(enabled=False),
 )
