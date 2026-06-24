@@ -2270,6 +2270,7 @@ class MiniTrainDIT(WeightTrainingStat):
                     x_main=x_B_T_H_W_D,
                     t_embedding_B_T_D=t_embedding_B_T_D,
                     crossattn_emb=context_input,
+                    adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 )
 
                 # 零初始化残差注入：训练初期 zero_proj 输出为 0，不影响主干

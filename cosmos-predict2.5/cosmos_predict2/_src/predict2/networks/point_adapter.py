@@ -239,7 +239,16 @@ class PointAdapter(nn.Module):
             # at iter 0, behaving like D4-A initially. MLP wakes up gradually
             # only if its capacity helps lower the loss. This lets us *add*
             # MLP without disturbing the trained-cross-attn equilibrium.
-            mlp_zero_init = self.adapter_mode in ("cross_attn_plus_mlp", "cross_attn_then_mlp")
+            # ControlNet semantics also require zero-gate at iter 0 (the
+            # "zero conv" idea: copied weights match backbone but adapter
+            # output is gated to 0, so it doesn't disturb the equilibrium).
+            # Otherwise the guard at line ~310 mis-fires on fresh init in
+            # adapter_mode="full" because xavier-init mlp gate (~3e-2) looks
+            # identical to a trained gate.
+            mlp_zero_init = (
+                self.adapter_mode in ("cross_attn_plus_mlp", "cross_attn_then_mlp")
+                or self.controlnet_copy
+            )
             for mod_name in (
                 "adaln_modulation_self_attn",
                 "adaln_modulation_cross_attn",
@@ -474,6 +483,7 @@ class PointAdapter(nn.Module):
         x_main: torch.Tensor,                  # [B, T, H, W, d_main], backbone block 输出
         t_embedding_B_T_D: Optional[torch.Tensor] = None,
         crossattn_emb: Optional[torch.Tensor] = None,  # 传 backbone 的 text emb, 本设计不用
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,  # backbone AdaLN-LoRA emb [B, T, 3*hidden]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A.v3 注入: video tokens 作为 query, PC tokens 作为 cross-attn K/V.
 
@@ -601,12 +611,34 @@ class PointAdapter(nn.Module):
                 # D4-A: cross-attn only
                 delta_BT_1_H_W_D = delta_ca.to(x_BT_1_H_W_D.dtype)
         else:
+            # adapter_mode == "full": run the full Block.forward
+            # (self-attn + cross-attn + MLP). Adapter Block was built with
+            # use_adaln_lora=True so that ControlNet copy can mirror backbone's
+            # AdaLN-LoRA modulation structure (minimal_v4_dit.py:1882). We MUST
+            # therefore thread backbone's adaln_lora_B_T_3D through, otherwise
+            # Block.forward crashes at `Tensor + None` (minimal_v4_dit.py:1336).
+            # Reshape (B, T, 3D) → (B*T, 1, 3D) to match per-frame batching.
+            if adaln_lora_B_T_3D is None:
+                raise ValueError(
+                    "apply_stage(adapter_mode='full') requires adaln_lora_B_T_3D "
+                    "from backbone — adapter Block was built with use_adaln_lora=True."
+                )
+            lora = adaln_lora_B_T_3D
+            if lora.shape[1] != T:
+                if lora.shape[1] == 1:
+                    lora = lora.expand(B, T, lora.shape[-1])
+                else:
+                    raise ValueError(
+                        f"adaln_lora_B_T_3D shape mismatch: expected dim1 == 1 or {T}, "
+                        f"got {tuple(lora.shape)}"
+                    )
+            lora_BT_1_3D = rearrange(lora, "b t d -> (b t) 1 d")
             out_BT_1_H_W_D = block(
                 x_BT_1_H_W_D,
                 emb_BT_1_D,
                 pc_feat_BT_K_da,            # crossattn_emb 替换为 PC tokens [B*T, K, D]
                 rope_emb_L_1_1_D=None,      # adapter 内部 self-attn 不需要 RoPE (per-frame spatial)
-                adaln_lora_B_T_3D=None,     # use_adaln_lora=False (跟 backbone 配置一致)
+                adaln_lora_B_T_3D=lora_BT_1_3D,
                 extra_per_block_pos_emb=None,
             )
             # delta = Block(x) - x; adaLN-zero 保证初始 delta ≈ 0
