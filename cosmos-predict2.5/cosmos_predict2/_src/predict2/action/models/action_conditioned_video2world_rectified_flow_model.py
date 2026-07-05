@@ -24,6 +24,7 @@ from torch import Tensor
 
 from cosmos_predict2._src.imaginaire.flags import INTERNAL
 from cosmos_predict2._src.imaginaire.utils import misc
+from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.imaginaire.utils.context_parallel import broadcast_split_tensor, cat_outputs_cp
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.configs.video2world.defaults.conditioner import Video2WorldCondition
@@ -63,6 +64,24 @@ class Video2WorldModelRectifiedFlowConfig(Text2WorldModelRectifiedFlowConfig):
 
 
 class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
+    def set_up_model(self):
+        super().set_up_model()
+        # LoRA (peft.get_peft_model) freezes ALL non-LoRA params, including the newly
+        # added action embedders -> the action pathway would stay at zero-init forever.
+        # Explicitly unfreeze them (same by-name pattern as the v5 PointAdapter freeze).
+        if getattr(self.config, "use_lora", False):
+            unfrozen = 0
+            for name, param in self.net.named_parameters():
+                if "action_embedder" in name:
+                    param.requires_grad = True
+                    unfrozen += param.numel()
+            trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.net.parameters())
+            log.info(
+                f"[ActionLoRA] unfroze action embedders: {unfrozen / 1e6:.1f}M; "
+                f"trainable {trainable / 1e6:.1f}M / {total / 1e6:.1f}M ({100 * trainable / total:.2f}%)"
+            )
+
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
     ) -> Tuple[Tensor, Tensor, Video2WorldCondition]:
