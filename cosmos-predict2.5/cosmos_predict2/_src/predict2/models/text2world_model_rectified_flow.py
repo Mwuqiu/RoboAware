@@ -95,6 +95,9 @@ class Text2WorldModelRectifiedFlowConfig:
     use_dora: bool = False
     lora_target_modules: str = "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2"
     init_lora_weights: bool = True
+    lora_layers_to_transform: Optional[list] = None  # stage-2: restrict LoRA to these block indices (e.g. [14..27])
+    lora_layers_pattern: Optional[str] = None        # stage-2: peft layers_pattern, e.g. "blocks"
+    lora_trainable_block_min: Optional[int] = None   # stage-2: only train LoRA on backbone blocks >= this index
 
     shift: int = 5
     use_dynamic_shift: bool = False
@@ -212,6 +215,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                         lora_target_modules=config.lora_target_modules,
                         init_lora_weights=config.init_lora_weights,
                         use_dora=config.use_dora,
+                        lora_layers_to_transform=config.lora_layers_to_transform,
+                        lora_layers_pattern=config.lora_layers_pattern,
                     )
             else:
                 with misc.timer("meta to cuda and broadcast model states"):
@@ -228,6 +233,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                         lora_target_modules=config.lora_target_modules,
                         init_lora_weights=config.init_lora_weights,
                         use_dora=config.use_dora,
+                        lora_layers_to_transform=config.lora_layers_to_transform,
+                        lora_layers_pattern=config.lora_layers_pattern,
                     )
 
                 if self.fsdp_device_mesh:
@@ -252,10 +259,30 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             self.net = self.build_net()
             # ── PointAdapter 冻结策略 ──────────────────────────────────────────
             self.net.requires_grad_(False)
-            for name, param in self.net.named_parameters():
-                if "point_adapter" in name:
+            if config.use_lora:
+                # stage-2: train ONLY LoRA adapters; point_adapter + backbone stay frozen.
+                # Optionally restrict trainable LoRA to backbone blocks >= block_min
+                # (2nd-half curriculum). First-half LoRA stays at zero-init (B=0) -> no effect.
+                import re as _re
+                _bmin = getattr(config, "lora_trainable_block_min", None)
+                for name, param in self.net.named_parameters():
+                    if "lora_" not in name:
+                        continue
+                    if _bmin is not None:
+                        _m = _re.search(r"blocks\.(\d+)\.", name)
+                        if _m is not None and int(_m.group(1)) < _bmin:
+                            continue
                     param.requires_grad = True
-            self.net.point_adapter.to(torch.bfloat16)
+            else:
+                # stage-1: train ONLY the point_adapter; backbone stays frozen
+                for name, param in self.net.named_parameters():
+                    if "point_adapter" in name:
+                        param.requires_grad = True
+            # peft (get_peft_model) wraps net -> point_adapter lives under base_model.model
+            _pa = getattr(self.net, "point_adapter", None)
+            if _pa is None:
+                _pa = self.net.base_model.model.point_adapter
+            _pa.to(torch.bfloat16)
             trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
             total     = sum(p.numel() for p in self.net.parameters())
             log.info(
@@ -1103,6 +1130,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         lora_target_modules: str = "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
         init_lora_weights: bool = True,
         use_dora: bool = False,
+        lora_layers_to_transform=None,
+        lora_layers_pattern=None,
     ) -> torch.nn.Module:
         """Add LoRA (Low-Rank Adaptation) adapters to `self.net`.
 
@@ -1166,6 +1195,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             init_lora_weights=init_lora_weights,
             target_modules=target_modules_list,
             use_dora=use_dora,
+            layers_to_transform=lora_layers_to_transform,
+            layers_pattern=lora_layers_pattern,
         )
 
         try:
